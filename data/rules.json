@@ -1,0 +1,19 @@
+{
+  "alwaysInclude": ["pwr-10k", "flt-bottle", "plug-eu", "earplugs"],
+  "activities": {
+    "hike": ["sock-wool", "headlamp", "base-layer"],
+    "city": [],
+    "camp": ["gas-stove"],
+    "boat": ["drybag"]
+  },
+  "climate": {
+    "rain": ["jkt-rain", "bag-cover", "poncho"],
+    "cold": ["mid-fleece", "base-layer"],
+    "tropical": ["repellent", "hat-sun"]
+  },
+  "durationHints": {
+    "short": [],
+    "medium": ["towel-micro"],
+    "long": ["med-kit", "liner"]
+  }
+}

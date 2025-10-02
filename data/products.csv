@@ -1,0 +1,9 @@
+id,name,category,tags,priority,weight_g,price_eur,asin
+pwr-10k,Powerbank 10.000 mAh,gadgets,"power,usb-c",must,220,29.99,B08XXXXX01
+sock-wool,Wollen sokken,kleding,"hike,warm",should,80,12.50,B07XXXXX02
+jkt-rain,Regenjas,kleding,"rain,wind",must,350,59.00,B0AXXXXX03
+bag-cover,Regenhoes backpack,gear,"rain,backpack",should,120,15.00,
+plug-eu,Wereldstekker,gadgets,"power,travel",must,90,18.00,
+med-kit,EHBO-set,health,"safety",should,150,22.00,
+flt-bottle,Herbruikbare fles 1L,gear,"water",must,120,14.00,
+earplugs,Oordopjes,health,"hostel",must,10,2.00
