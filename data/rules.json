@@ -1,19 +1,37 @@
 {
   "alwaysInclude": ["pwr-10k", "flt-bottle", "plug-eu", "earplugs"],
+
   "activities": {
-    "hike": ["sock-wool", "headlamp", "base-layer"],
-    "city": [],
-    "camp": ["gas-stove"],
-    "boat": ["drybag"]
+    "hike": ["sock-wool", "headlamp", "base-layer", "trail-shoes", "trek-socks", "rain-jacket", "drybag-small"],
+    "city": ["daypack", "sneakers", "money-belt", "shirt-light", "shorts", "refill-bottle"],
+    "camp": ["gas-stove", "lighter", "tent", "sleeping-bag", "sleeping-mat", "camp-cookset", "spork", "headlamp"],
+    "boat": ["drybag", "swimwear", "micro-towel", "reef-safe-sunscreen", "sunglasses", "cap"],
+
+    "hostel": ["earplugs", "sleep-mask", "padlock", "flipflops", "micro-towel", "toiletry-bag"],
+    "nightbus": ["neck-pillow", "blanket", "compression-socks", "sleep-mask", "snacks", "powerbank"],
+    "longtrain": ["neck-pillow", "snacks", "earphones", "powerbank", "book-kindle"],
+    "beach": ["swimwear", "micro-towel", "flipflops", "sunscreen", "hat", "drybag-small"],
+    "snorkeling": ["mask-snorkel", "reef-safe-sunscreen", "rashguard", "drybag-small"],
+    "diving": ["logbook", "mouthpiece", "mesh-bag", "reef-safe-sunscreen"],
+    "surfing": ["rashguard", "wax", "boardshorts", "reef-shoes"],
+    "kitesurfing": ["harness", "repair-kit", "spare-lines", "rashguard"],
+    "roadtrip": ["car-charger", "microfiber-towel", "snacks", "water-bottle", "sunglasses"],
+    "scooter": ["helmet", "gloves-light", "rain-jacket", "sunglasses"],
+    "motorbike": ["helmet", "gloves", "buff", "rain-gear", "base-layer"],
+    "photography": ["camera", "spare-sd", "tripod", "cleaning-kit", "powerbank"],
+    "creator": ["camera", "microphone", "tripod", "powerbank", "laptop"],
+    "work": ["laptop", "charger", "multiplug", "laptop-stand", "mouse", "notebook"],
+    "volunteering": ["work-gloves", "old-clothes", "hat", "sunscreen", "reusable-bottle"],
+    "festival": ["hydration-pack", "earplugs-pro", "powerbank", "lightweight-jacket"],
+    "nightlife": ["nice-shirt", "deodorant", "money-belt", "condoms", "small-bag"],
+    "alpine": ["down-jacket", "base-layer", "thermal-pants", "trek-socks", "beanie", "gloves"],
+    "laundry": ["laundry-soap-sheets", "clothesline", "sink-plug", "drybag-small"],
+    "backpacking": ["packing-cubes", "compression-bag", "document-pouch", "guidebook"]
   },
-  "climate": {
-    "rain": ["jkt-rain", "bag-cover", "poncho"],
-    "cold": ["mid-fleece", "base-layer"],
-    "tropical": ["repellent", "hat-sun"]
-  },
+
   "durationHints": {
-    "short": [],
-    "medium": ["towel-micro"],
-    "long": ["med-kit", "liner"]
+    "short": ["mini-laundry-soap"],
+    "medium": ["extra-socks", "extra-underwear", "towel-micro"],
+    "long": ["med-kit", "liner", "spare-cables", "sewing-kit"]
   }
 }
