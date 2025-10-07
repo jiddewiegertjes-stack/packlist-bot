@@ -1,22 +1,21 @@
 {
   "name": "packlist-bot",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "private": true,
+  "type": "module",
   "scripts": {
-  "dev": "next dev -p 3000",
-  "build": "next build",
-  "start": "next start -p 3000"
-},
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
+    "dev": "next dev -p 3000",
+    "build": "next build",
+    "start": "next start -p 3000"
+  },
   "dependencies": {
     "csv-parse": "^6.1.0",
-    "openai": "^6.0.1"
+    "openai": "^6.0.1",
+    "next": "^14.2.5",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
   },
-  "devDependencies": {
-    "vercel": "^48.1.6"
-  },
-  "type": "module"
+  "engines": {
+    "node": ">=18"
+  }
 }
