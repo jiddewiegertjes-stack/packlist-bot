@@ -72,21 +72,106 @@ const toolDefs = [{
 }];
 
 export default async function handler(req, res) {
-  if (req.method === "OPTIONS") { res.status(200).end(); return; }
-  if (req.method !== "POST") { res.status(405).json({ error: "Use POST" }); return; }
+  // CORS preflight
+  if (req.method === "OPTIONS") {
+    res.setHeader("Access-Control-Allow-Origin", "*");               // of jouw Framer domein
+    res.setHeader("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+    res.status(200).end();
+    return;
+  }
 
-  const { messages, trip } = req.body || {};
+  // Healthcheck op GET (handig in de browser)
+  if (req.method === "GET") {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.status(405).json({ error: "Use POST" });
+    return;
+  }
+
+  if (req.method !== "POST") {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.status(405).json({ error: "Use POST" });
+    return;
+  }
+
+  // ---- Body robuust lezen (sommige runtimes vullen req.body niet) ----
+  let body = {};
+  try {
+    if (!req.body || typeof req.body === "string") {
+      const chunks = [];
+      for await (const c of req) chunks.push(c);
+      const raw = Buffer.concat(chunks).toString("utf8") || "{}";
+      body = JSON.parse(raw);
+    } else {
+      body = req.body;
+    }
+  } catch (e) {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.status(400).json({ error: "INVALID_JSON", message: String(e?.message || e) });
+    return;
+  }
+
+  const { messages, trip } = body || {};
+
+  // ---- Debug modes via query (?mode=echo|nostream) ----
+  const urlObj = new URL(req.url, "https://dummy");
+  const mode = urlObj.searchParams.get("mode");
+
+  if (mode === "echo") {
+    // Geen OpenAI; direct packlist uit rules+CSV
+    try {
+      const activities = normalizeActivities((trip?.activities) || []);
+      const durationDays = Math.max(1, Math.min(365, Math.floor(trip?.durationDays || 7)));
+      const items = await buildPacklist({ activities, durationDays });
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      res.status(200).json({ mode: "echo", activities, durationDays, itemsCount: items.length, items });
+      return;
+    } catch (e) {
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      res.status(500).json({ mode: "echo", error: String(e?.message || e) });
+      return;
+    }
+  }
+
+  if (mode === "nostream") {
+    // OpenAI zonder SSE (makkelijk debuggen)
+    try {
+      const seed = messages ?? [
+        { role: "system", content: SYSTEM_PROMPT },
+        { role: "assistant", content: "Top! Hoelang ga je (dagen) en welke activiteiten? (bijv. hiking, city, camp, boat …)" },
+        { role: "user", content: trip ? JSON.stringify(trip) : "Ik ga 14 dagen backpacken met veel hiken en een paar nachtbussen." }
+      ];
+      const resp = await openai.responses.create({
+        model: process.env.OPENAI_MODEL || "gpt-4o-mini",
+        input: seed,
+        tools: toolDefs
+      });
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      res.status(200).json(resp);
+      return;
+    } catch (e) {
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      res.status(500).json({ mode: "nostream", error: String(e?.message || e) });
+      return;
+    }
+  }
+
+  // ---- Normale SSE-stream ----
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream; charset=utf-8",
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive",
+    "Access-Control-Allow-Origin": "*"              // CORS voor Framer
+  });
+
+  // Eerste 'ping' zodat clients meteen iets zien
+  res.write(`data: ${JSON.stringify({ delta: "🔌 verbinding oké, model wordt aangeroepen…" })}\n\n`);
+
   const seed = messages ?? [
     { role: "system", content: SYSTEM_PROMPT },
     { role: "assistant", content: "Top! Hoelang ga je (dagen) en welke activiteiten? (bijv. hiking, city, camp, boat …)" },
     { role: "user", content: trip ? JSON.stringify(trip) : "Ik ga 14 dagen backpacken met veel hiken en een paar nachtbussen." }
   ];
-
-  res.writeHead(200, {
-    "Content-Type": "text/event-stream; charset=utf-8",
-    "Cache-Control": "no-cache",
-    "Connection": "keep-alive"
-  });
 
   let stream;
   try {
@@ -96,7 +181,7 @@ export default async function handler(req, res) {
       tools: toolDefs
     });
   } catch (e) {
-    res.write(`event: error\ndata: ${JSON.stringify({ error: e.message })}\n\n`);
+    res.write(`event: error\ndata: ${JSON.stringify({ error: String(e?.message || e) })}\n\n`);
     res.end();
     return;
   }
@@ -110,7 +195,7 @@ export default async function handler(req, res) {
         const items = await buildPacklist({ activities, durationDays });
         await event.submitToolOutput(JSON.stringify({ items }));
       } catch (e) {
-        await event.submitToolOutput(JSON.stringify({ error: "tool_failed", message: e.message }));
+        await event.submitToolOutput(JSON.stringify({ error: "tool_failed", message: String(e?.message || e) }));
       }
     }
   });
@@ -122,7 +207,7 @@ export default async function handler(req, res) {
 
   stream.on("end", () => res.end());
   stream.on("error", (e) => {
-    res.write(`event: error\ndata: ${JSON.stringify({ error: e.message })}\n\n`);
+    res.write(`event: error\ndata: ${JSON.stringify({ error: String(e?.message || e) })}\n\n`);
     res.end();
   });
 
