@@ -74,14 +74,14 @@ const toolDefs = [{
 export default async function handler(req, res) {
   // CORS preflight
   if (req.method === "OPTIONS") {
-    res.setHeader("Access-Control-Allow-Origin", "*");               // of jouw Framer domein
+    res.setHeader("Access-Control-Allow-Origin", "*"); // of jouw Framer-domein
     res.setHeader("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type");
     res.status(200).end();
     return;
   }
 
-  // Healthcheck op GET (handig in de browser)
+  // Healthcheck op GET
   if (req.method === "GET") {
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.status(405).json({ error: "Use POST" });
@@ -94,7 +94,7 @@ export default async function handler(req, res) {
     return;
   }
 
-  // ---- Body robuust lezen (sommige runtimes vullen req.body niet) ----
+  // Body robuust lezen
   let body = {};
   try {
     if (!req.body || typeof req.body === "string") {
@@ -113,12 +113,11 @@ export default async function handler(req, res) {
 
   const { messages, trip } = body || {};
 
-  // ---- Debug modes via query (?mode=echo|nostream) ----
+  // Debug modes
   const urlObj = new URL(req.url, "https://dummy");
   const mode = urlObj.searchParams.get("mode");
 
   if (mode === "echo") {
-    // Geen OpenAI; direct packlist uit rules+CSV
     try {
       const activities = normalizeActivities((trip?.activities) || []);
       const durationDays = Math.max(1, Math.min(365, Math.floor(trip?.durationDays || 7)));
@@ -134,7 +133,6 @@ export default async function handler(req, res) {
   }
 
   if (mode === "nostream") {
-    // OpenAI zonder SSE (makkelijk debuggen)
     try {
       const seed = messages ?? [
         { role: "system", content: SYSTEM_PROMPT },
@@ -156,15 +154,15 @@ export default async function handler(req, res) {
     }
   }
 
-  // ---- Normale SSE-stream ----
+  // --- SSE-stream ---
   res.writeHead(200, {
     "Content-Type": "text/event-stream; charset=utf-8",
     "Cache-Control": "no-cache",
     "Connection": "keep-alive",
-    "Access-Control-Allow-Origin": "*"              // CORS voor Framer
+    "Access-Control-Allow-Origin": "*" // CORS voor Framer
   });
 
-  // Eerste 'ping' zodat clients meteen iets zien
+  // Eerste ping
   res.write(`data: ${JSON.stringify({ delta: "🔌 verbinding oké, model wordt aangeroepen…" })}\n\n`);
 
   const seed = messages ?? [
@@ -181,7 +179,10 @@ export default async function handler(req, res) {
       tools: toolDefs
     });
   } catch (e) {
-    res.write(`event: error\ndata: ${JSON.stringify({ error: String(e?.message || e) })}\n\n`);
+    // 🔴 Stuur fout óók als data-frame zodat de frontend 'm ziet
+    const msg = String(e?.message || e);
+    res.write(`data: ${JSON.stringify({ delta: `\n\n[error] ${msg}` })}\n\n`);
+    res.write(`event: error\ndata: ${JSON.stringify({ error: msg })}\n\n`);
     res.end();
     return;
   }
@@ -195,7 +196,8 @@ export default async function handler(req, res) {
         const items = await buildPacklist({ activities, durationDays });
         await event.submitToolOutput(JSON.stringify({ items }));
       } catch (e) {
-        await event.submitToolOutput(JSON.stringify({ error: "tool_failed", message: String(e?.message || e) }));
+        const msg = String(e?.message || e);
+        await event.submitToolOutput(JSON.stringify({ error: "tool_failed", message: msg }));
       }
     }
   });
@@ -207,7 +209,10 @@ export default async function handler(req, res) {
 
   stream.on("end", () => res.end());
   stream.on("error", (e) => {
-    res.write(`event: error\ndata: ${JSON.stringify({ error: String(e?.message || e) })}\n\n`);
+    // 🔴 Ook hier: data-frame + error-event
+    const msg = String(e?.message || e);
+    res.write(`data: ${JSON.stringify({ delta: `\n\n[error] ${msg}` })}\n\n`);
+    res.write(`event: error\ndata: ${JSON.stringify({ error: msg })}\n\n`);
     res.end();
   });
 
