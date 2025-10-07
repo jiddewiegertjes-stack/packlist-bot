@@ -1,1 +1,27 @@
+<<<<<<< Updated upstream
 { "name": "packlist-bot", "version": "1.0.0", "description": "", "main": "index.js", "scripts": { "test": "echo \"Error: no test specified\" && exit 1", "dev": "vercel dev", "start": "vercel dev", "deploy": "vercel deploy --prod" }, "keywords": [], "author": "", "license": "ISC", "dependencies": { "csv-parse": "^6.1.0", "openai": "^6.0.1" }, "devDependencies": { "vercel": "^48.1.6" }, "type": "module" }
+=======
+{
+  "name": "packlist-bot",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "dev": "vercel dev --ignore-dev-command",
+    "start": "vercel dev",
+    "deploy": "vercel deploy --prod"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "csv-parse": "^6.1.0",
+    "openai": "^6.0.1"
+  },
+  "devDependencies": {
+    "vercel": "^48.1.6"
+  },
+  "type": "module"
+}
+>>>>>>> Stashed changes
