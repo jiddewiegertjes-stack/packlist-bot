@@ -1,12 +1,6 @@
-// api/packlist.js
-// Node (@vercel/node) — werkt met req/res, geen Edge-streams nodig.
-
-import OpenAI from "openai";
-
-/** ---------- Helpers ---------- **/
+// api/packlist.js (CommonJS, safe on @vercel/node)
 
 function writeSSE(res, event) {
-  // event: { event?: string, data?: any, comment?: string }
   if (event.comment) res.write(`: ${event.comment}\n\n`);
   if (event.event) res.write(`event: ${event.event}\n`);
   if (event.data !== undefined) {
@@ -18,33 +12,27 @@ function writeSSE(res, event) {
 const MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
 const CSV_URL = process.env.CSV_URL;
 
-// simpele CSV parser (ondersteunt quotes); voor complexere CSV kun je csv-parse gebruiken.
 function parseCsv(text) {
-  // Minimal, pragmatic parser (ondersteunt "..." met comma's binnen quotes)
   const rows = [];
   let i = 0, field = "", row = [], inQuotes = false;
-
   const pushField = () => { row.push(field); field = ""; };
   const pushRow = () => { rows.push(row); row = []; };
 
   while (i < text.length) {
     const c = text[i];
-
     if (inQuotes) {
       if (c === '"') {
-        if (text[i + 1] === '"') { field += '"'; i += 2; continue; } // escaped quote
+        if (text[i + 1] === '"') { field += '"'; i += 2; continue; }
         inQuotes = false; i++; continue;
       }
       field += c; i++; continue;
     }
-
     if (c === '"') { inQuotes = true; i++; continue; }
     if (c === ",") { pushField(); i++; continue; }
     if (c === "\n") { pushField(); pushRow(); i++; continue; }
-    if (c === "\r") { i++; continue; } // ignore CR
+    if (c === "\r") { i++; continue; }
     field += c; i++;
   }
-  // last field/row
   pushField();
   if (row.length > 1 || (row.length === 1 && row[0] !== "")) pushRow();
 
@@ -57,21 +45,18 @@ function parseCsv(text) {
   });
 }
 
-// Eenvoudige in-memory cache voor CSV
 let __csvCache = { at: 0, data: [] };
 async function getCsvProducts(force = false) {
-  const TTL_MS = 5 * 60 * 1000; // 5 min
-  if (!force && Date.now() - __csvCache.at < TTL_MS && __csvCache.data.length) {
-    return __csvCache.data;
-  }
-  if (!CSV_URL) throw new Error("CSV_URL ontbreekt (Vercel env).");
+  const TTL_MS = 5 * 60 * 1000;
+  if (!force && Date.now() - __csvCache.at < TTL_MS && __csvCache.data.length) return __csvCache.data;
+  if (!CSV_URL) throw new Error("CSV_URL ontbreekt in env (Vercel Settings → Environment Variables).");
   const res = await fetch(CSV_URL);
-  if (!res.ok) throw new Error(`CSV download failed: ${res.status}`);
+  if (!res.ok) {
+    const msg = `CSV download failed: ${res.status} ${res.statusText}`;
+    throw new Error(msg);
+  }
   const text = await res.text();
   const rows = parseCsv(text);
-
-  // Verwacht kolommen (voorbeeld): category,name,weight_grams,seasons,activities,url,image
-  // Je kunt dit hier mappen naar je eigen schema:
   const products = rows.map((r) => ({
     category: r.category || r.Category || "",
     name: r.name || r.Product || r.Title || "",
@@ -82,146 +67,128 @@ async function getCsvProducts(force = false) {
     image: r.image || r.Image || "",
     raw: r
   }));
-
   __csvCache = { at: Date.now(), data: products };
   return products;
 }
 
-function filterProducts(products, { activities = [], season = "all", maxWeight = 4000, durationDays = 7 }) {
+function filterProducts(products, { activities = [], season = "all", maxWeight = 4000 }) {
   const acts = activities.map((a) => a.toLowerCase());
   const seasonKey = String(season || "all").toLowerCase();
-
   let list = products.slice();
-
-  // filter op activiteiten (losjes: product.activities bevat 1 van acts)
-  if (acts.length) {
-    list = list.filter((p) => {
-      if (!p.activities) return true; // geen label = algemeen
-      return acts.some((a) => p.activities.includes(a));
-    });
-  }
-
-  // filter op season (losjes)
-  if (seasonKey !== "all") {
-    list = list.filter((p) => {
-      if (!p.seasons) return true;
-      return p.seasons.includes(seasonKey) || p.seasons.includes("all");
-    });
-  }
-
-  // eenvoudig gewichtslimiet (optioneel)
+  if (acts.length) list = list.filter((p) => !p.activities || acts.some((a) => p.activities.includes(a)));
+  if (seasonKey !== "all") list = list.filter((p) => !p.seasons || p.seasons.includes(seasonKey) || p.seasons.includes("all"));
   if (maxWeight) list = list.filter((p) => p.weight_grams <= maxWeight || !p.weight_grams);
-
-  // sorteer licht → zwaar, prefer matches
   list.sort((a, b) => (a.weight_grams || 999999) - (b.weight_grams || 999999));
-
-  // duration hint (bijv. 3× sokken bij 14 dagen): dit doen we in prompt, niet hier
   return list;
 }
 
-/** ---------- Handler ---------- **/
+module.exports = async (req, res) => {
+  // Zorg dat fouten als JSON terugkomen
+  const safeError = (status, message, extra = {}) => {
+    try {
+      res.status(status).json({ ok: false, error: message, ...extra });
+    } catch (_) {
+      try { res.end(); } catch {}
+    }
+  };
 
-export default async function handler(req, res) {
-  // parse body
+  // Body parsen
   let body = {};
-  try {
-    if (typeof req.body === "string") body = JSON.parse(req.body || "{}");
-    else body = req.body || {};
-  } catch {
-    body = {};
-  }
+  try { body = typeof req.body === "string" ? JSON.parse(req.body || "{}") : (req.body || {}); }
+  catch { body = {}; }
 
-  // GET = health / hint
   if (req.method === "GET") {
     return res.status(200).json({
       ok: true,
-      hint: "POST hiernaartoe met { activities: string[], durationDays: number, season?: 'summer'|'winter'|'shoulder'|'all' } en optioneel ?stream=1"
+      hint: "POST met { activities: string[], durationDays: number, season?: 'summer'|'winter'|'shoulder'|'all' }. Stream met ?stream=1"
     });
   }
-
   if (req.method !== "POST") {
     res.setHeader("Allow", "GET, POST");
-    return res.status(405).json({ ok: false, error: "Method Not Allowed" });
+    return safeError(405, "Method Not Allowed");
   }
 
   const { activities = [], durationDays = 7, season = "all", preferences = {} } = body;
   const wantStream = String(req.query?.stream || req.query?.s || req.query?.mode) === "1";
 
+  // CSV vooraf checken → heldere fout als URL/permission fout is
+  let products, shortlist;
   try {
-    // 1) CSV laden + filteren
-    const products = await getCsvProducts();
-    const shortlist = filterProducts(products, { activities, season, durationDays });
+    products = await getCsvProducts();
+    shortlist = filterProducts(products, { activities, season, durationDays });
+  } catch (e) {
+    return safeError(500, "CSV_ERROR", { details: e.message });
+  }
 
-    // Maak compacte context (truncate om tokenkosten te beperken)
-    const productContext = shortlist.slice(0, 60).map((p) => ({
-      category: p.category,
-      name: p.name,
-      weight_grams: p.weight_grams || undefined,
-      activities: p.activities || undefined,
-      seasons: p.seasons || undefined,
-      url: p.url || undefined
-    }));
+  // OpenAI veilig & dynamisch importeren (werkt in CJS)
+  if (!process.env.OPENAI_API_KEY) {
+    return safeError(500, "OPENAI_API_KEY ontbreekt in env.");
+  }
 
-    // 2) OpenAI voorbereiden
-    if (!process.env.OPENAI_API_KEY) {
-      throw new Error("OPENAI_API_KEY ontbreekt (Vercel env).");
-    }
-    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+  let OpenAI;
+  try {
+    ({ default: OpenAI } = await import("openai"));
+  } catch (e) {
+    return safeError(500, "OPENAI_PKG_ERROR", { details: e.message });
+  }
 
-    const sys = [
-      "Je bent een ervaren backpack-expert. Je geeft een minimalistische maar complete paklijst, afgestemd op activiteiten, duur en seizoen.",
-      "– Geef concrete aantallen per item (bv. 3× sokken voor 2 weken).",
-      "– Houd rekening met gewicht & weer; voorkom overpakken.",
-      "– Adviseer ultralight alternatieven waar logisch.",
-      "– Verwijs bij producten subtiel naar de `url` als die er is.",
-      "– Output: eerst een korte samenvatting (3–5 bullets), daarna een gecategoriseerde lijst.",
-    ].join("\n");
+  const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-    const userMsg = {
-      role: "user",
-      content: [
-        { type: "text", text: `Maak een paklijst.\nDuur: ${durationDays} dagen\nActiviteiten: ${activities.join(", ") || "geen specifieke"}\nSeizoen: ${season}\nVoorkeuren: ${JSON.stringify(preferences)}` },
-        { type: "text", text: `Beschikbare producten (max 60):\n${JSON.stringify(productContext).slice(0, 12000)}` }
-      ]
-    };
+  const sys = [
+    "Je bent een ervaren backpack-expert. Maak een minimalistische maar complete paklijst per categorie.",
+    "– Geef concrete aantallen per item (bv. 3× sokken voor 14 dagen).",
+    "– Houd rekening met activiteiten, seizoen en gewicht.",
+    "– Noem waar mogelijk producten uit de meegeleverde context (met url).",
+    "– Output: korte samenvatting (3–5 bullets), daarna categorieën met items."
+  ].join("\n");
 
-    // 3) Niet-streamend pad: eenvoudig te testen/integraal antwoord
-    if (!wantStream) {
+  const productContext = shortlist.slice(0, 60).map((p) => ({
+    category: p.category, name: p.name, weight_grams: p.weight_grams || undefined,
+    activities: p.activities || undefined, seasons: p.seasons || undefined, url: p.url || undefined
+  }));
+
+  const userMsg = {
+    role: "user",
+    content: [
+      { type: "text", text: `Maak een paklijst.\nDuur: ${durationDays} dagen\nActiviteiten: ${activities.join(", ") || "geen"}\nSeizoen: ${season}\nVoorkeuren: ${JSON.stringify(preferences)}` },
+      { type: "text", text: `Beschikbare producten (max 60):\n${JSON.stringify(productContext).slice(0, 12000)}` }
+    ]
+  };
+
+  if (!wantStream) {
+    try {
       const completion = await openai.chat.completions.create({
-        model: MODEL,
-        temperature: 0.5,
+        model: MODEL, temperature: 0.5,
         messages: [{ role: "system", content: sys }, userMsg],
       });
-
       const advice = completion.choices?.[0]?.message?.content || "";
       return res.status(200).json({
         ok: true,
         advice,
-        suggestedProducts: shortlist.slice(0, 30), // stuur top 30 mee (client kan renderen/ deeplinks tonen)
+        suggestedProducts: shortlist.slice(0, 30),
         meta: { model: MODEL }
       });
+    } catch (e) {
+      return safeError(500, "OPENAI_ERROR", { details: e.message });
     }
+  }
 
-    // 4) STREAM modus (SSE)
-    res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
-    res.setHeader("Cache-Control", "no-cache, no-transform");
-    res.setHeader("Connection", "keep-alive");
-    res.setHeader("Access-Control-Allow-Origin", "*");
+  // STREAM (SSE)
+  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("Access-Control-Allow-Origin", "*");
 
-    const heartbeat = setInterval(() => {
-      try { writeSSE(res, { comment: "heartbeat" }); } catch {}
-    }, 15000);
-    const cleanup = () => clearInterval(heartbeat);
-    req.on("close", cleanup);
-    req.on("aborted", cleanup);
+  const hb = setInterval(() => { try { writeSSE(res, { comment: "heartbeat" }); } catch {} }, 15000);
+  const cleanup = () => clearInterval(hb);
+  req.on("close", cleanup); req.on("aborted", cleanup);
 
+  try {
     writeSSE(res, { event: "start", data: { activities, durationDays, season, model: MODEL } });
-    writeSSE(res, { event: "context", data: { products: productContext.slice(0, 20) } }); // kleine voorproef
+    writeSSE(res, { event: "context", data: { products: productContext.slice(0, 20) } });
 
     const stream = await openai.chat.completions.create({
-      model: MODEL,
-      temperature: 0.5,
-      stream: true,
+      model: MODEL, temperature: 0.5, stream: true,
       messages: [{ role: "system", content: sys }, userMsg],
     });
 
@@ -233,13 +200,8 @@ export default async function handler(req, res) {
     writeSSE(res, { event: "products", data: shortlist.slice(0, 30) });
     writeSSE(res, { event: "done", data: { ok: true } });
     res.end();
-  } catch (err) {
-    const message = err?.message || "unknown error";
-    if (wantStream) {
-      writeSSE(res, { event: "error", data: { message } });
-      try { res.end(); } catch {}
-      return;
-    }
-    return res.status(500).json({ ok: false, error: message });
+  } catch (e) {
+    writeSSE(res, { event: "error", data: { message: e.message } });
+    try { res.end(); } catch {}
   }
-}
+};
