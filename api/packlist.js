@@ -127,15 +127,6 @@ module.exports = async (req, res) => {
     "Je bent een ervaren backpack-expert. Minimalistische maar complete paklijst per categorie.",
     "– Concrete aantallen per item; rekening met duur, activiteiten en seizoen.",
     "– Lichtgewicht voorkeur; gebruik meegeleverde productcontext met url waar passend.",
-  "  Geef de “Korte samenvatting” ALTIJD als:
-**Korte samenvatting**
-
-- punt 1
-- punt 2
-- punt 3
-
-Daarna een blanco regel en ga verder met de volgende secties.
-Gebruik nooit “###” of inline streepjes voor dit blok."
     "– Output: korte samenvatting (3–5 bullets) + gecategoriseerde lijst."
   ].join("\n");
 
