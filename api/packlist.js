@@ -1,501 +1,581 @@
-import * as React from "react"
+// app/api/packlist/route.js
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
 
-/**
- * PacklistAssistant — met geheugen (localStorage)
- * - Promptgedreven, multi-turn slot-filling
- * - Slaat 'contextOut' op in localStorage en stuurt dit elke beurt mee
- * - Reset-knop om gesprek/geheugen te wissen
- */
-
-const API_BASE = "https://packlist-bot.vercel.app"
-const CTX_STORAGE_KEY = "packlist_ctx_v1" // 🔑 hier bewaren we context
-
-/* ---------- Types ---------- */
-type Product = {
-  category?: string
-  name?: string
-  weight_grams?: number
-  activities?: string
-  seasons?: string
-  url?: string
-  image?: string
+/* ---------------- CORS helpers ---------------- */
+function buildCorsHeaders(req) {
+  const origin = req.headers.get("origin") || "*";
+  const requested = req.headers.get("access-control-request-headers");
+  return {
+    "Access-Control-Allow-Origin": origin,
+    "Vary": "Origin",
+    "Access-Control-Allow-Methods": "GET,POST,OPTIONS,HEAD",
+    "Access-Control-Allow-Headers": requested || "Content-Type, Authorization, Accept",
+    "Access-Control-Max-Age": "86400",
+  };
 }
-type ProductsEvent = Product[]
-type NeedsPayload = { missing?: string[]; contextOut?: any }
-type ContextPayload = { products?: any[]; season?: string }
+function withCors(req, init = {}) {
+  const headers = new Headers(init.headers || {});
+  const cors = buildCorsHeaders(req);
+  Object.entries(cors).forEach(([k, v]) => headers.set(k, v));
+  return new Response(init.body || null, { ...init, headers });
+}
 
-/* ---------- SSE helper ---------- */
-async function* sseLines(reader: ReadableStreamDefaultReader<Uint8Array>) {
-  const decoder = new TextDecoder("utf-8")
-  let buffer = ""
-  while (true) {
-    const { value, done } = await reader.read()
-    if (done) break
-    buffer += decoder.decode(value, { stream: true })
-    let idx: number
-    while ((idx = buffer.indexOf("\n\n")) >= 0) {
-      const raw = buffer.slice(0, idx).trimEnd()
-      buffer = buffer.slice(idx + 2)
-      if (raw.length) yield raw
-    }
+/* ---------------- SSE helpers (Web Streams) ---------------- */
+function sseEncode(event) {
+  let chunk = "";
+  if (event.comment) chunk += `: ${event.comment}\n`;
+  if (event.event) chunk += `event: ${event.event}\n`;
+  if (event.data !== undefined) {
+    const payload =
+      typeof event.data === "string" ? event.data : JSON.stringify(event.data);
+    chunk += `data: ${payload}\n`;
   }
-  if (buffer.trim().length) yield buffer
+  return chunk + "\n";
+}
+function sseHeaders(req) {
+  const base = buildCorsHeaders(req);
+  return {
+    ...base,
+    "Content-Type": "text/event-stream; charset=utf-8",
+    "Cache-Control": "no-cache, no-transform",
+    "Connection": "keep-alive",
+    "X-Accel-Buffering": "no",
+  };
 }
 
-/* ---------- Formatter helpers (ongewijzigd) ---------- */
-function escapeHtml(s: string) {
-  return s.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;")
+/* ---------------- Config ---------------- */
+const MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
+const CSV_URL = process.env.CSV_URL;
+const SEASONS_URL = process.env.SEASONS_URL || null;
+
+/* ---------------- Tiny CSV parser ---------------- */
+function parseCsv(text) {
+  const rows = [];
+  let i = 0, field = "", row = [], inQuotes = false;
+  const pushField = () => { row.push(field); field = ""; };
+  const pushRow = () => { rows.push(row); row = []; };
+  while (i < text.length) {
+    const c = text[i];
+    if (inQuotes) {
+      if (c === '"') {
+        if (text[i + 1] === '"') { field += '"'; i += 2; continue; }
+        inQuotes = false; i++; continue;
+      }
+      field += c; i++; continue;
+    }
+    if (c === '"') { inQuotes = true; i++; continue; }
+    if (c === ",") { pushField(); i++; continue; }
+    if (c === "\n") { pushField(); pushRow(); i++; continue; }
+    if (c === "\r") { i++; continue; }
+    field += c; i++;
+  }
+  pushField();
+  if (row.length > 1 || (row.length === 1 && row[0] !== "")) pushRow();
+  if (!rows.length) return [];
+  const headers = rows[0].map((h) => String(h || "").trim());
+  return rows.slice(1).map((r) => {
+    const o = {};
+    headers.forEach((h, idx) => (o[h] = (r[idx] ?? "").toString().trim()));
+    return o;
+  });
 }
-function inlineMd(s: string) {
-  let out = s
-  out = out.replace(/`([^`]+)`/g, (_m, c) => `<code class="ai-inline-code">${escapeHtml(c)}</code>`)
-  out = out.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
-  out = out.replace(/(^|[^*])\*([^*]+)\*(?!\*)/g, (_m, pre, txt) => `${pre}<em>${txt}</em>`)
-  out = out.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, (_m, t, u) => `<a href="${u}" target="_blank" rel="noreferrer">${escapeHtml(t)}</a>`)
-  return out
+
+/* ---------------- Products ---------------- */
+let __csvCache = { at: 0, data: [] };
+async function getCsvProducts(force = false) {
+  const TTL_MS = 5 * 60 * 1000;
+  if (!force && Date.now() - __csvCache.at < TTL_MS && __csvCache.data.length)
+    return __csvCache.data;
+  if (!CSV_URL) throw new Error("CSV_URL ontbreekt in env.");
+  const r = await fetch(CSV_URL);
+  if (!r.ok) throw new Error(`CSV download failed: ${r.status} ${r.statusText}`);
+  const text = await r.text();
+  const rows = parseCsv(text);
+  const products = rows.map((r) => ({
+    category: r.category || r.Category || "",
+    name: r.name || r.Product || r.Title || "",
+    weight_grams: Number(r.weight_grams || r.Weight || 0) || 0,
+    seasons: (r.seasons || r.Seasons || "all").toLowerCase(),
+    activities: (r.activities || r.Activities || "").toLowerCase(),
+    url: r.url || r.Link || r.URL || "",
+    image: r.image || r.Image || "",
+    raw: r,
+  }));
+  __csvCache = { at: Date.now(), data: products };
+  return products;
 }
-function normalizeLLMText(raw: string): string {
-  if (!raw) return ""
-  const blocks: string[] = []
-  let t = raw.replace(/```([\s\S]*?)```/g, (_m, code) => { blocks.push(code); return `@@CODE_${blocks.length - 1}@@` })
-  t = t
-    .replace(/\r\n/g, "\n")
-    .replace(/(^|\n)\s*[*-]\s*(Korte\s*samenvatting)/i, (_m, pre, w) => `${pre}${w}`)
-    .replace(/(#{1,6})([^\s#])/g, (_m, h, rest) => `${h} ${rest}`)
-    .replace(/(^|[^\n])(#{1,6})/g, (_m, pre, h) => `${pre}\n${h}`)
-    .replace(/([.,:;!?])([^\s])/g, "$1 $2")
-    .replace(/([a-zà-ÿ])([A-ZÀ-Ý])/g, "$1 $2")
-    .replace(/([A-Za-zÀ-ÿ])(\d)/g, "$1 $2")
-    .replace(/(\d)([A-Za-zÀ-ÿ])/g, "$1 $2")
-    .replace(/([A-Za-zÀ-ÿ0-9])-(?=[A-Za-zÀ-ÿ0-9])/g, "$1 - ")
-    .replace(/(^|\n)\s*([-*+])(?=[^\s-])/g, (_m, pre, b) => `${pre}${b} `)
-    .replace(/\n{3,}/g, "\n\n")
-  t = t.replace(/@@CODE_(\d+)@@/g, (_m, i) => "```" + blocks[Number(i)] + "```")
-  return t.trim()
+function filterProducts(products, { activities = [], season = "all", maxWeight = 4000 }) {
+  const acts = activities.map((a) => a.toLowerCase());
+  const seasonKey = String(season || "all").toLowerCase();
+  let list = products.slice();
+  if (acts.length)
+    list = list.filter((p) => !p.activities || acts.some((a) => p.activities.includes(a)));
+  if (seasonKey !== "all")
+    list = list.filter((p) => !p.seasons || p.seasons.includes(seasonKey) || p.seasons.includes("all"));
+  if (maxWeight) list = list.filter((p) => p.weight_grams <= maxWeight || !p.weight_grams);
+  list.sort((a, b) => (a.weight_grams || 999999) - (b.weight_grams || 999999));
+  return list;
 }
-function beautifySummary(text: string): string {
-  const re =
-    /(?:^|\n)\s*(?:[-*]\s*)?(?:\*\*)?\s*Korte\s*samenvatting\s*(?:\*\*)?\s*[:：]?\s*\n?([\s\S]*?)(?=\n\s*(?:\*\*(?:Kleding|Gear|Gadgets|Health|Tips)\*\*|(?:Kleding|Gear|Gadgets|Health|Tips)\s*[-:]|#{1,6}\s|\n{2,}|$))/i
-  const m = text.match(re)
-  if (!m) return text
-  let body = (m[1] || "").trim()
-  const hasBullets = /^[-*]\s+/m.test(body)
-  let bullets: string[]
-  if (hasBullets) bullets = body.split(/\n/).map((s) => s.replace(/^\s*[-*]\s*/, "").trim()).filter(Boolean)
+
+/* ---------------- Seasons (optional) ---------------- */
+let __seasonsCache = { at: 0, data: null };
+async function loadSeasons(force = false) {
+  if (!SEASONS_URL) return null;
+  const TTL_MS = 5 * 60 * 1000;
+  if (!force && __seasonsCache.data && Date.now() - __seasonsCache.at < TTL_MS)
+    return __seasonsCache.data;
+  const r = await fetch(SEASONS_URL);
+  if (!r.ok) throw new Error(`SEASONS_URL fetch failed: ${r.status} ${r.statusText}`);
+  const ct = (r.headers.get("content-type") || "").toLowerCase();
+  let data;
+  if (ct.includes("application/json")) data = await r.json();
   else {
-    body = body.replace(/\s[-–—]\s/g, ". ")
-    bullets = body.replace(/([.!?])\s+(?=[A-ZÀ-Ý0-9])/g, "$1\n").split(/\n|•/).map((s) => s.trim()).filter(Boolean)
+    const text = await r.text();
+    data = normalizeSeasonsCSV(parseCsv(text));
   }
-  bullets = bullets.slice(0, 5)
-  if (!bullets.length) return text
-  const pretty = `**Korte samenvatting**\n\n${bullets.map((b) => `- ${b}`).join("\n")}\n\n`
-  return text.replace(re, `\n${pretty}`)
+  __seasonsCache = { at: Date.now(), data };
+  return data;
 }
-function structureSections(text: string): string {
-  const sections = ["Kleding", "Gear", "Gadgets", "Health", "Tips"]
-  let out = text
-  for (const sec of sections) {
-    const titleRe = new RegExp(String.raw`(^|\n)\s*(?:\*\*)?\s*${sec}\s*(?:\*\*)?\s*[-:]\s*`, "gi")
-    out = out.replace(titleRe, (_m, pre) => `${pre}**${sec}**\n`)
+function normalizeSeasonsCSV(rows) {
+  const byKey = new Map();
+  for (const r of rows) {
+    const country = (r.country || r.Country || "").trim();
+    const region = (r.region || r.Region || "").trim() || null;
+    const months = String(r.months || r.Months || "")
+      .split("|")
+      .map((s) => parseInt(String(s).trim(), 10))
+      .filter(Boolean);
+    const season = (r.season || r.Season || "").trim().toLowerCase() || "all";
+    if (!country || !months.length) continue;
+    const key = country.toLowerCase() + "||" + (region ? region.toLowerCase() : "");
+    if (!byKey.has(key)) byKey.set(key, { country, region, rules: [] });
+    byKey.get(key).rules.push({ months, season });
   }
-  for (const sec of sections) {
-    const blockRe = new RegExp(String.raw`(\*\*${sec}\*\*[\s\S]*?)(?=\n\*\*(?:${sections.join("|")})\*\*|\n{2,}|$)`, "g")
-    out = out.replace(blockRe, (block) => {
-      let b = block
-      if (!/^[-*]\s+/m.test(b) && /\s[-–—]\s/.test(b)) {
-        b = b.replace(new RegExp(String.raw`(\*\*${sec}\*\*\s*)`), (_m, head) => `${head}- `)
-        b = b.replace(/\s[-–—]\s/g, "\n- ")
-      }
-      b = b.replace(new RegExp(String.raw`(\*\*${sec}\*\*)(?!\s*\n)`), `$1\n`)
-      return b
-    })
-  }
-  return out
+  return Array.from(byKey.values());
 }
-function formatToChatUI(raw: string): string {
-  if (!raw) return ""
-  const normalized = structureSections(beautifySummary(normalizeLLMText(raw)))
-  const lines = normalized.split("\n")
-  const out: string[] = []
-  let inCode = false
-  let codeLang = ""
-  let codeBuf: string[] = []
-  let listType: "ul" | "ol" | null = null
-  const flushList = () => { if (listType) { out.push(`</${listType}>`); listType = null } }
-  const startList = (type: "ul" | "ol") => { if (listType !== type) { flushList(); listType = type; out.push(`<${type} class="ai-list">`) } }
-  const flushCode = () => {
-    if (!inCode) return
-    const codeHtml = escapeHtml(codeBuf.join("\n"))
-    const langClass = codeLang ? ` language-${codeLang}` : ""
-    out.push(`<div class="ai-codeblock"><pre class="ai-pre"><code class="ai-code${langClass}">${codeHtml}</code></pre></div>`)
-    inCode = false; codeLang = ""; codeBuf = []
-  }
-  for (const lineRaw of lines) {
-    const line = lineRaw
-    const fence = line.match(/^```(\w+)?\s*$/)
-    if (fence) { if (!inCode) { flushList(); inCode = true; codeLang = fence[1] || ""; codeBuf = [] } else { flushCode() } ; continue }
-    if (inCode) { codeBuf.push(line); continue }
-    if (!line.trim()) { flushList(); continue }
-    const h = line.match(/^(#{1,6})\s+(.*)$/)
-    if (h) { flushList(); out.push(`<p class="ai-heading">${inlineMd(h[2].trim())}</p>`); continue }
-    const bq = line.match(/^>\s?(.*)$/)
-    if (bq) { flushList(); out.push(`<blockquote class="ai-quote">${inlineMd(bq[1])}</blockquote>`); continue }
-    if (/^\s*\d+\.\s+/.test(line)) { startList("ol"); out.push(`<li>${inlineMd(line.replace(/^\s*\d+\.\s+/, ""))}</li>`); continue }
-    if (/^\s*[-*]\s+/.test(line)) { startList("ul"); out.push(`<li>${inlineMd(line.replace(/^\s*[-*]\s+/, ""))}</li>`); continue }
-    if (/^\s*---+\s*$/.test(line)) { flushList(); out.push(`<hr class="ai-hr" />`); continue }
-    flushList(); out.push(`<p>${inlineMd(line.trim())}</p>`)
-  }
-  flushList(); flushCode()
-  return `
-<style>
-  .ai-rich { font-size: 15px; line-height: 1.75; }
-  .ai-rich p { margin: 10px 0; }
-  .ai-rich .ai-heading { font-weight: 600; margin: 14px 0 6px; }
-  .ai-rich .ai-list { padding-left: 22px; margin: 8px 0; }
-  .ai-rich .ai-list li { margin: 6px 0; }
-  .ai-rich .ai-quote { border-left: 3px solid rgba(0,0,0,.12); margin: 12px 0; padding: 6px 12px; background: rgba(0,0,0,.03); border-radius: 8px; }
-  .ai-rich code.ai-inline-code { font-family: ui-monospace,Menlo,Consolas,monospace; font-size: .92em; padding: 1px 6px; border-radius: 6px; background: rgba(15,23,42,.06); }
-  .ai-rich .ai-codeblock { border: 1px solid rgba(0,0,0,.08); border-radius: 12px; overflow: hidden; margin: 12px 0; }
-  .ai-rich .ai-pre { margin:0; padding:10px; background: rgba(15,23,42,.03); overflow:auto; }
-  .ai-rich .ai-hr { border:none; border-top:1px solid rgba(0,0,0,.08); margin: 14px 0; }
-  .ai-rich a { text-decoration: underline; text-underline-offset: 3px; }
-</style>
-<div class="ai-rich">${out.join("")}</div>`
+function monthFromDate(dateISO) {
+  if (!dateISO) return null;
+  try { return new Date(dateISO).getUTCMonth() + 1; } catch { return null; }
+}
+function inferSeasonForTrip({ seasonsData, country, region, startDate, endDate }) {
+  if (!seasonsData || !country) return "all";
+  const mm = monthFromDate(startDate || endDate);
+  if (!mm) return "all";
+  const lcCountry = country.toLowerCase();
+  const lcRegion = region ? region.toLowerCase() : null;
+  const match =
+    (lcRegion &&
+      seasonsData.find(
+        (s) => s.country?.toLowerCase() === lcCountry && s.region?.toLowerCase() === lcRegion
+      )) ||
+    seasonsData.find((s) => s.country?.toLowerCase() === lcCountry && !s.region);
+  const rules = match?.rules || [];
+  const found = rules.find((r) => Array.isArray(r.months) && r.months.includes(mm));
+  return found?.season || "all";
 }
 
-/* ---------- LocalStorage helpers (geheugen) ---------- */
-function loadContext(): any | null {
-  try { return JSON.parse(localStorage.getItem(CTX_STORAGE_KEY) || "null") } catch { return null }
+/* ---------------- Time utils ---------------- */
+function safeDateISO(d) {
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(d.getUTCDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
 }
-function saveContext(ctx: any) {
-  try { localStorage.setItem(CTX_STORAGE_KEY, JSON.stringify(ctx)) } catch {}
+function diffDaysInclusive(aISO, bISO) {
+  const a = new Date(aISO);
+  const b = new Date(bISO);
+  const utcA = Date.UTC(a.getUTCFullYear(), a.getUTCMonth(), a.getUTCDate());
+  const utcB = Date.UTC(b.getUTCFullYear(), b.getUTCMonth(), b.getUTCDate());
+  return Math.max(1, Math.round((utcB - utcA) / 86400000) + 1);
 }
-function clearContext() {
-  try { localStorage.removeItem(CTX_STORAGE_KEY) } catch {}
+function parseMonthName(nl) {
+  const t = (nl || "").toLowerCase().trim();
+  const map = {
+    jan: 1, januari: 1, feb: 2, februari: 2, mrt: 3, maart: 3, apr: 4, april: 4,
+    mei: 5, jun: 6, juni: 6, jul: 7, juli: 7, aug: 8, augustus: 8, sep: 9, sept: 9, september: 9,
+    okt: 10, oktober: 10, nov: 11, november: 11, dec: 12, december: 12,
+  };
+  return map[t] || null;
 }
-function deepMerge(a: any, b: any) {
-  if (Array.isArray(a) && Array.isArray(b)) return Array.from(new Set([...a, ...b]))
-  if (a && typeof a === "object" && b && typeof b === "object") {
-    const out: any = { ...a }
-    for (const k of Object.keys(b)) out[k] = deepMerge(a?.[k], b[k])
-    return out
+
+/* ---------------- Slot-filling helpers ---------------- */
+async function extractTripFactsWithLLM(openai, prompt) {
+  const sys = `Je krijgt een Nederlandse prompt over een reis. Antwoord ALLEEN met JSON.
+Velden:
+- destination: { country: string|null, region: string|null }
+- durationDays: int|null
+- startDate: YYYY-MM-DD|null
+- endDate: YYYY-MM-DD|null
+- month: string|null
+- activities: string[]
+- preferences: object|null`;
+  const user = `Prompt: """${prompt}"""`;
+  const r = await openai.chat.completions.create({
+    model: MODEL,
+    temperature: 0,
+    messages: [{ role: "system", content: sys }, { role: "user", content: user }],
+  });
+  try {
+    const txt = r.choices?.[0]?.message?.content?.trim() || "{}";
+    return JSON.parse(txt);
+  } catch {
+    return {};
   }
-  return b ?? a
 }
-
-/* ---------- UI bits ---------- */
-const BrandIcon: React.FC<{ color?: string }> = ({ color = "currentColor" }) => (
-  <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke={color} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-    <circle cx="12" cy="12" r="9" />
-    <path d="M3 12h18" />
-    <path d="M12 3a15 15 0 0 1 0 18" />
-    <path d="M12 3a15 15 0 0 0 0 18" />
-  </svg>
-)
-
-/* ---------- Component ---------- */
-type Props = { initialPrompt?: string; showHint?: boolean }
-
-export default function PacklistAssistant({
-  initialPrompt = "ik ga 20 dagen naar Indonesië, maak een backpacklijst",
-  showHint = true,
-}: Props) {
-  // font
-  React.useEffect(() => {
-    const id = "poppins-font-link"
-    if (!document.getElementById(id)) {
-      const link = document.createElement("link")
-      link.id = id
-      link.rel = "stylesheet"
-      link.href = "https://fonts.googleapis.com/css2?family=Poppins:wght@400;600;700&display=swap"
-      document.head.appendChild(link)
+function mergeContext(prev = {}, ext = {}) {
+  return {
+    destination: {
+      country: prev?.destination?.country || ext?.destination?.country || null,
+      region: prev?.destination?.region || ext?.destination?.region || null,
+    },
+    startDate: prev?.startDate || ext?.startDate || null,
+    endDate: prev?.endDate || ext?.endDate || null,
+    durationDays: prev?.durationDays || ext?.durationDays || null,
+    month: prev?.month || ext?.month || null,
+    activities: Array.from(new Set([...(prev?.activities || []), ...(ext?.activities || [])])),
+    preferences: { ...(ext?.preferences || {}), ...(prev?.preferences || {}) },
+  };
+}
+function findMissing(ctx) {
+  const missing = [];
+  const reasons = {};
+  if (!ctx?.destination?.country) {
+    missing.push("destination.country");
+    reasons["destination.country"] = "Land ontbreekt.";
+  }
+  const hasDuration = !!ctx?.durationDays,
+    hasStart = !!ctx?.startDate,
+    hasEnd = !!ctx?.endDate,
+    hasMonth = !!ctx?.month;
+  if (!((hasDuration && hasStart) || (hasStart && hasEnd) || (hasDuration && hasEnd) || (hasDuration && hasMonth))) {
+    missing.push("period");
+    reasons["period"] = "Geef duur + (startdatum of maand), of start + eind.";
+  }
+  return { missing, reasons };
+}
+function normalizeDates(ctx) {
+  let { startDate, endDate, durationDays, month } = ctx;
+  if (startDate && durationDays && !endDate) {
+    const s = new Date(startDate);
+    const e = new Date(s.getTime() + (durationDays - 1) * 86400000);
+    endDate = safeDateISO(e);
+  } else if (endDate && durationDays && !startDate) {
+    const e = new Date(endDate);
+    const s = new Date(e.getTime() - (durationDays - 1) * 86400000);
+    startDate = safeDateISO(s);
+  } else if (!startDate && !endDate && durationDays && month) {
+    const m = parseMonthName(month);
+    if (m) {
+      const now = new Date();
+      const thisMonth = now.getUTCMonth() + 1;
+      const year = m <= thisMonth ? now.getUTCFullYear() + 1 : now.getUTCFullYear();
+      const s = new Date(Date.UTC(year, m - 1, 1));
+      const e = new Date(s.getTime() + (durationDays - 1) * 86400000);
+      startDate = safeDateISO(s);
+      endDate = safeDateISO(e);
     }
-  }, [])
+  }
+  const dur =
+    durationDays || (startDate && endDate ? diffDaysInclusive(startDate, endDate) : undefined);
+  return { ...ctx, startDate, endDate, durationDays: dur };
+}
+function buildFollowUpQuestionTemplate(merged, missing) {
+  const parts = [];
+  if (missing.includes("destination.country")) parts.push("land (en evt. regio)");
+  if (missing.includes("period")) parts.push("duur + (startdatum of maand)");
+  const need = parts.join(" en ");
+  return `Helder! Kun je nog aangeven: ${need}? Bijvoorbeeld: "20 dagen in juli naar Indonesië".`;
+}
 
-  const [darkMode, setDarkMode] = React.useState(false)
-  const [running, setRunning] = React.useState(false)
-  const [prompt, setPrompt] = React.useState(initialPrompt)
-  const [deltaText, setDeltaText] = React.useState("")
-  const [products, setProducts] = React.useState<Product[]>([])
-  const [error, setError] = React.useState<string | null>(null)
-  const [needsMsg, setNeedsMsg] = React.useState<string | null>(null)
-  const [seasonHint, setSeasonHint] = React.useState<string | null>(null)
+/* ---------------- SYSTEM PROMPT voor advies ---------------- */
+const SYS_ADVICE = String.raw`Je bent een ervaren backpack-expert. Je maakt een minimalistische maar complete paklijst
+die rekening houdt met duur, bestemming(en), activiteiten en seizoen. Schrijf in het Nederlands.
 
-  // geheugen in component
-  const needsRef = React.useRef<NeedsPayload | null>(null)
-  const abortRef = React.useRef<AbortController | null>(null)
+1) **Korte samenvatting** – 3–5 bullets met omstandigheden en strategie (laagjes/regen/gewicht).
+2) **De paklijst** – secties **Kleding**, **Gear**, **Gadgets**, **Health**, **Tips** met concrete items en aantallen.
+Stijl: kort, deskundig, alleen Markdown; stream complete zinnen/bullets.`;
 
-  // laad eventueel bestaand geheugen (1x)
-  React.useEffect(() => {
-    const stored = loadContext()
-    if (stored) needsRef.current = { contextOut: stored, missing: [] }
-  }, [])
+/* ---------------- Handlers ---------------- */
+export async function OPTIONS(req) {
+  return withCors(req, { status: 204 });
+}
+export async function GET(req) {
+  return withCors(req, {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      ok: true,
+      hint:
+        "POST { prompt, context? }  (stream met ?stream=1). Back-compat: { activities, durationDays, season }.",
+    }),
+  });
+}
+export async function POST(req) {
+  const url = new URL(req.url);
+  const wantStream = url.searchParams.get("stream") === "1" || url.searchParams.get("s") === "1";
 
-  // selectie-state
-  const [selected, setSelected] = React.useState<Record<string, boolean>>({})
-  const productKey = (p: Product, i: number) => `${p.name ?? "item"}|${p.url ?? ""}|${i}`
-  const toggleSelected = (key: string) => setSelected((s) => ({ ...s, [key]: !s[key] }))
+  // Body
+  let body = {};
+  try { body = await req.json(); } catch { body = {}; }
 
-  const resetView = React.useCallback(() => {
-    setDeltaText("")
-    setProducts([])
-    setError(null)
-    setSelected({})
-    setNeedsMsg(null)
-    // seizoen-hint mag blijven staan
-  }, [])
-  const handleStop = React.useCallback(() => {
-    abortRef.current?.abort()
-    abortRef.current = null
-    setRunning(false)
-  }, [])
-  const formattedHTML = React.useMemo(() => formatToChatUI(deltaText), [deltaText])
+  // Prompt-modus?
+  if (typeof body?.prompt === "string" && body.prompt.trim()) {
+    if (!process.env.OPENAI_API_KEY)
+      return withCors(req, { status: 500, body: JSON.stringify({ ok: false, error: "OPENAI_API_KEY ontbreekt in env." }) });
 
-  const submitPrompt = React.useCallback(async () => {
-    if (running || !prompt.trim()) return
-    resetView()
-    setRunning(true)
+    let OpenAI;
+    try { ({ default: OpenAI } = await import("openai")); }
+    catch (e) {
+      return withCors(req, { status: 500, body: JSON.stringify({ ok: false, error: "OPENAI_PKG_ERROR", details: String(e?.message || e) }) });
+    }
+    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-    try {
-      const ac = new AbortController()
-      abortRef.current = ac
+    if (!wantStream) {
+      // non-stream fallback JSON
+      try {
+        // extract & complete flow (zelfde als stream, maar 1-shot)
+        const ext = await extractTripFactsWithLLM(openai, body.prompt.trim());
+        const merged = mergeContext(body.context || {}, ext);
+        const { missing } = findMissing(merged);
+        if (missing.length) {
+          return withCors(req, {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ ok: true, needs: { missing, contextOut: merged } }),
+          });
+        }
+        const norm = normalizeDates(merged);
+        let derivedSeason = "all";
+        try {
+          const seasonsData = await loadSeasons();
+          derivedSeason =
+            inferSeasonForTrip({
+              seasonsData,
+              country: norm?.destination?.country,
+              region: norm?.destination?.region,
+              startDate: norm?.startDate,
+              endDate: norm?.endDate,
+            }) || "all";
+        } catch { derivedSeason = "all"; }
 
-      // ⭐️ Prompt + samengevoegde context (geheugen)
-      const stored = loadContext()
-      const fromNeeds = needsRef.current?.contextOut
-      const mergedContext = deepMerge(stored || {}, fromNeeds || {})
-      if (Object.keys(mergedContext || {}).length) saveContext(mergedContext) // sync vóór call
+        const products = await getCsvProducts();
+        const shortlist = filterProducts(products, {
+          activities: norm.activities || [],
+          season: derivedSeason,
+          maxWeight: 4000,
+        });
+        const productContext = shortlist.slice(0, 60).map((p) => ({
+          category: p.category,
+          name: p.name,
+          weight_grams: p.weight_grams || undefined,
+          activities: p.activities || undefined,
+          seasons: p.seasons || undefined,
+          url: p.url || undefined,
+        }));
+        const userContent =
+          `Maak een paklijst.\n` +
+          `Bestemming: ${norm?.destination?.country || "-"}${norm?.destination?.region ? " - " + norm?.destination?.region : ""}\n` +
+          `Periode: ${norm?.startDate || "?"} t/m ${norm?.endDate || "?"} (${norm?.durationDays || "?"} dagen)\n` +
+          `Afgeleid seizoen: ${derivedSeason}\n` +
+          `Activiteiten: ${(norm.activities || []).join(", ") || "geen"}\n` +
+          `Voorkeuren: ${JSON.stringify(norm.preferences || {})}\n\n` +
+          `Beschikbare producten (max 60):\n` +
+          `${JSON.stringify(productContext).slice(0, 12000)}\n`;
 
-      const body: any = { prompt: prompt.trim() }
-      if (mergedContext && Object.keys(mergedContext).length) body.context = mergedContext
+        const completion = await openai.chat.completions.create({
+          model: MODEL, temperature: 0.5,
+          messages: [{ role: "system", content: SYS_ADVICE }, { role: "user", content: userContent }],
+        });
+        const advice = completion.choices?.[0]?.message?.content || "";
+        return withCors(req, {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ ok: true, advice, suggestedProducts: shortlist.slice(0, 30), meta: { model: MODEL } }),
+        });
+      } catch (e) {
+        return withCors(req, {
+          status: 500,
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ ok: false, error: "OPENAI_ERROR", details: String(e?.message || e) }),
+        });
+      }
+    }
 
-      const res = await fetch(`${API_BASE}/api/packlist?stream=1`, {
-        method: "POST",
+    // -------- SSE stream response --------
+    const stream = new ReadableStream({
+      start: async (controller) => {
+        const write = (evt) => controller.enqueue(new TextEncoder().encode(sseEncode(evt)));
+        const heartbeat = setInterval(() => {
+          try { write({ comment: "heartbeat" }); } catch {}
+        }, 15000);
+        const close = () => { try { clearInterval(heartbeat); } catch {} };
+
+        try {
+          write({ comment: "connected" });
+
+          const userPrompt = body.prompt.trim();
+          const ctxIn = body.context || {};
+
+          // 1) extract → merge → check missing
+          const ext = await extractTripFactsWithLLM(openai, userPrompt);
+          const merged = mergeContext(ctxIn, ext);
+          const { missing, reasons } = findMissing(merged);
+          write({ event: "start", data: { model: MODEL, missing, reasons } });
+
+          if (missing.length) {
+            const followUp = buildFollowUpQuestionTemplate(merged, missing);
+            write({ event: "delta", data: { text: `\n${followUp}\n` } });
+            write({ event: "needs", data: { missing, contextOut: merged } });
+            write({ event: "done", data: { ok: true } });
+            controller.close(); close(); return;
+          }
+
+          // 2) complete → normalize
+          const norm = normalizeDates(merged);
+
+          // 3) seasons
+          let derivedSeason = "all";
+          try {
+            const seasonsData = await loadSeasons();
+            derivedSeason =
+              inferSeasonForTrip({
+                seasonsData,
+                country: norm?.destination?.country,
+                region: norm?.destination?.region,
+                startDate: norm?.startDate,
+                endDate: norm?.endDate,
+              }) || "all";
+          } catch { derivedSeason = "all"; }
+
+          // 4) products
+          let products = [], shortlist = [];
+          try {
+            products = await getCsvProducts();
+            shortlist = filterProducts(products, {
+              activities: norm.activities || [],
+              season: derivedSeason,
+              maxWeight: 4000,
+            });
+          } catch (e) {
+            write({ event: "error", data: { message: "CSV_ERROR", details: String(e?.message || e) } });
+            controller.close(); close(); return;
+          }
+
+          const productContext = shortlist.slice(0, 60).map((p) => ({
+            category: p.category,
+            name: p.name,
+            weight_grams: p.weight_grams || undefined,
+            activities: p.activities || undefined,
+            seasons: p.seasons || undefined,
+            url: p.url || undefined,
+          }));
+          const userContent =
+            `Maak een paklijst.\n` +
+            `Bestemming: ${norm?.destination?.country || "-"}${norm?.destination?.region ? " - " + norm?.destination?.region : ""}\n` +
+            `Periode: ${norm?.startDate || "?"} t/m ${norm?.endDate || "?"} (${norm?.durationDays || "?"} dagen)\n` +
+            `Afgeleid seizoen: ${derivedSeason}\n` +
+            `Activiteiten: ${(norm.activities || []).join(", ") || "geen"}\n` +
+            `Voorkeuren: ${JSON.stringify(norm.preferences || {})}\n\n` +
+            `Beschikbare producten (max 60):\n` +
+            `${JSON.stringify(productContext).slice(0, 12000)}\n`;
+
+          write({ event: "context", data: { products: productContext.slice(0, 20), season: derivedSeason } });
+
+          const resp = await openai.chat.completions.create({
+            model: MODEL, temperature: 0.5, stream: true,
+            messages: [{ role: "system", content: SYS_ADVICE }, { role: "user", content: userContent }],
+          });
+
+          for await (const part of resp) {
+            const delta = part.choices?.[0]?.delta?.content;
+            if (delta) write({ event: "delta", data: delta });
+          }
+
+          write({ event: "products", data: shortlist.slice(0, 30) });
+          write({ event: "done", data: { ok: true } });
+          controller.close(); close();
+        } catch (e) {
+          try {
+            const msg = String(e?.message || e);
+            controller.enqueue(new TextEncoder().encode(sseEncode({ event: "error", data: { message: msg } })));
+          } finally { controller.close(); }
+        }
+      },
+      cancel() { /* client closed */ },
+    });
+
+    return new Response(stream, { status: 200, headers: sseHeaders(req) });
+  }
+
+  /* ---------- Legacy pad (activities/duration/season) ---------- */
+  const { activities = [], durationDays = 7, season = "all", preferences = {} } = body;
+
+  try {
+    const products = await getCsvProducts();
+    const shortlist = filterProducts(products, { activities, season, maxWeight: 4000 });
+
+    if (!process.env.OPENAI_API_KEY)
+      return withCors(req, { status: 500, body: JSON.stringify({ ok: false, error: "OPENAI_API_KEY ontbreekt in env." }) });
+
+    let OpenAI; ({ default: OpenAI } = await import("openai"));
+    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+    const productContext = shortlist.slice(0, 60).map((p) => ({
+      category: p.category, name: p.name, weight_grams: p.weight_grams || undefined,
+      activities: p.activities || undefined, seasons: p.seasons || undefined, url: p.url || undefined,
+    }));
+    const userContent =
+      `Maak een paklijst.\nDuur: ${durationDays} dagen\nActiviteiten: ${activities.join(", ") || "geen"}\nSeizoen: ${season}\nVoorkeuren: ${JSON.stringify(preferences)}\n\nBeschikbare producten (max 60):\n${JSON.stringify(productContext).slice(0, 12000)}\n`;
+
+    if (!wantStream) {
+      const completion = await openai.chat.completions.create({
+        model: MODEL, temperature: 0.5,
+        messages: [{ role: "system", content: SYS_ADVICE }, { role: "user", content: userContent }],
+      });
+      const advice = completion.choices?.[0]?.message?.content || "";
+      return withCors(req, {
+        status: 200,
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-        signal: ac.signal,
-      })
-      if (!res.ok || !res.body) throw new Error(`Stream response not OK (${res.status})`)
-
-      const reader = res.body.getReader()
-      for await (const chunk of sseLines(reader)) {
-        let ev: string | null = null
-        let dataRaw = ""
-        for (const line of chunk.split("\n")) {
-          if (line.startsWith("event:")) ev = line.slice(6).trim()
-          else if (line.startsWith("data:")) dataRaw += line.slice(5)
-        }
-
-        if (ev === "start") {
-          setNeedsMsg(null)
-        } else if (ev === "delta") {
-          try {
-            const maybe = JSON.parse(dataRaw)
-            if (typeof maybe === "string") setDeltaText((t) => t + maybe)
-            else if (typeof (maybe as any)?.text === "string") setDeltaText((t) => t + (maybe as any).text)
-            else setDeltaText((t) => t + dataRaw)
-          } catch { setDeltaText((t) => t + dataRaw) }
-        } else if (ev === "needs") {
-          try {
-            const payload = (JSON.parse(dataRaw) as NeedsPayload) || {}
-            // 🔐 geheugen updaten en bewaren
-            const newCtx = deepMerge(loadContext() || {}, payload.contextOut || {})
-            saveContext(newCtx)
-            needsRef.current = { missing: payload.missing || [], contextOut: newCtx }
-
-            const labels = (payload.missing || []).map((m) =>
-              m === "destination.country" ? "land/regio" :
-              m === "period" ? "duur + (startdatum of maand)" : m
-            )
-            setNeedsMsg(labels.length ? `Ik mis nog: ${labels.join(" & ")}` : null)
-          } catch {}
-        } else if (ev === "context") {
-          try {
-            const ctx = JSON.parse(dataRaw) as ContextPayload
-            if (ctx?.season) setSeasonHint(`Afgeleid seizoen: ${ctx.season}`)
-          } catch {}
-        } else if (ev === "products") {
-          try { setProducts((JSON.parse(dataRaw) as ProductsEvent) || []) } catch {}
-        } else if (ev === "error") {
-          try { setError((JSON.parse(dataRaw) as any)?.message || "Onbekende fout uit stream") }
-          catch { setError(dataRaw || "Onbekende fout uit stream") }
-          break
-        } else if (ev === "done") {
-          // niks
-          break
-        }
-      }
-
-      setRunning(false)
-      abortRef.current = null
-    } catch (e: any) {
-      setError(e?.message || "Onbekende fout")
-      setRunning(false)
+        body: JSON.stringify({ ok: true, advice, suggestedProducts: shortlist.slice(0, 30), meta: { model: MODEL } }),
+      });
     }
-  }, [running, prompt, resetView])
 
-  // Submit op Cmd/Ctrl+Enter of Enter (zonder Shift)
-  const onKeyDown: React.KeyboardEventHandler<HTMLTextAreaElement> = (e) => {
-    const isCmdEnter = (e.metaKey || e.ctrlKey) && e.key === "Enter"
-    const isPlainEnter = e.key === "Enter" && !e.shiftKey
-    if (isCmdEnter || isPlainEnter) { e.preventDefault(); submitPrompt() }
+    // Legacy SSE
+    const stream = new ReadableStream({
+      start: async (controller) => {
+        const write = (evt) => controller.enqueue(new TextEncoder().encode(sseEncode(evt)));
+        const heartbeat = setInterval(() => { try { write({ comment: "heartbeat" }); } catch {} }, 15000);
+        const close = () => { try { clearInterval(heartbeat); } catch {} };
+
+        try {
+          write({ event: "start", data: { activities, durationDays, season, model: MODEL } });
+          write({ event: "context", data: { products: productContext.slice(0, 20) } });
+
+          const resp = await openai.chat.completions.create({
+            model: MODEL, temperature: 0.5, stream: true,
+            messages: [{ role: "system", content: SYS_ADVICE }, { role: "user", content: userContent }],
+          });
+          for await (const part of resp) {
+            const delta = part.choices?.[0]?.delta?.content;
+            if (delta) write({ event: "delta", data: delta });
+          }
+
+          write({ event: "products", data: shortlist.slice(0, 30) });
+          write({ event: "done", data: { ok: true } });
+          controller.close(); close();
+        } catch (e) {
+          write({ event: "error", data: { message: String(e?.message || e) } });
+          controller.close(); close();
+        }
+      },
+    });
+    return new Response(stream, { status: 200, headers: sseHeaders(req) });
+  } catch (e) {
+    return withCors(req, {
+      status: 500,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ok: false, error: "SERVER_ERROR", details: String(e?.message || e) }),
+    });
   }
-
-  // Reset gesprek/geheugen
-  const onResetConversation = () => {
-    clearContext()
-    needsRef.current = null
-    setNeedsMsg(null)
-    setSeasonHint(null)
-    // Laat AI output staan of wis ook:
-    setDeltaText("")
-    setProducts([])
-  }
-
-  React.useEffect(() => () => abortRef.current?.abort(), [])
-  const theme = darkMode ? dark : light
-
-  return (
-    <div style={{ ...container, background: theme.bg, color: theme.text }}>
-      {/* Header + Dark mode */}
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-        <h3 style={{ margin: 0 }}>Packlist Assistant</h3>
-        <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
-          <button onClick={onResetConversation} style={btnSecondary(theme)} aria-label="Reset gesprek">
-            Reset gesprek
-          </button>
-          <label style={{ fontSize: 12, cursor: "pointer" }}>
-            <input type="checkbox" checked={darkMode} onChange={() => setDarkMode((v) => !v)} style={{ marginRight: 6 }} />
-            Dark mode
-          </label>
-        </div>
-      </div>
-
-      {/* Promptveld (geen knop) */}
-      <div style={{ display: "grid", gap: 6 }}>
-        <label style={label}>Beschrijf je trip</label>
-        <textarea
-          value={prompt}
-          onChange={(e) => setPrompt(e.target.value)}
-          onKeyDown={onKeyDown}
-          placeholder='bv. "20 dagen in juli naar Indonesië, hiken en duiken"'
-          rows={3}
-          style={{ ...textareaStyle, background: theme.inputBg, color: theme.text, borderColor: theme.border }}
-        />
-        {!needsMsg && showHint && (
-          <div style={{ ...muted, marginTop: -2 }}>
-            Druk <strong>Enter</strong> (zonder Shift) of <strong>Cmd/Ctrl + Enter</strong> om te starten.
-          </div>
-        )}
-        {needsMsg && (
-          <div style={{ ...muted, marginTop: -2 }}>
-            {needsMsg}. Antwoord in het tekstveld en druk Enter.
-          </div>
-        )}
-        {seasonHint && <div style={{ ...muted, marginTop: -2 }}>{seasonHint}</div>}
-      </div>
-
-      {/* Stop-knop tijdens streamen */}
-      {running && (
-        <div style={controlsRow}>
-          <button onClick={handleStop} style={btnDanger} aria-label="Stop genereren">Stop</button>
-        </div>
-      )}
-
-      {error && (
-        <div style={{ ...errorBox, background: theme.errorBg, color: theme.errorText, borderColor: theme.errorBorder }}>
-          <strong>Fout:</strong> {error}
-        </div>
-      )}
-
-      {/* AI Output */}
-      <div style={{ display: "grid", gap: 8 }}>
-        <div style={sectionTitle}>AI Output</div>
-        <div style={{ ...outputBox, background: theme.outputBg, borderColor: theme.border, color: theme.text }}
-             dangerouslySetInnerHTML={{ __html: formattedHTML }} />
-      </div>
-
-      {/* Suggested Products */}
-      <div style={{ display: "grid", gap: 8 }}>
-        <div style={sectionTitle}>Suggested Products</div>
-        {products?.length ? (
-          <ul style={productsGrid}>
-            {products.map((p, i) => {
-              const key = productKey(p, i)
-              const isSelected = !!selected[key]
-              const card: React.CSSProperties = {
-                ...productCard, position: "relative",
-                borderColor: isSelected ? SELECTED.border : theme.border,
-                background: isSelected ? SELECTED.bg : "transparent",
-                color: isSelected ? "#ffffff" : theme.text,
-                transition: "background .15s ease, border-color .15s ease, color .15s ease",
-                cursor: "pointer",
-              }
-              const checkBox: React.CSSProperties = {
-                position: "absolute", top: 10, right: 10, width: 22, height: 22, borderRadius: 8,
-                border: `1px solid ${isSelected ? "#ffffff" : theme.border}`, display: "grid", placeItems: "center",
-                fontSize: 14, lineHeight: 1, background: isSelected ? "rgba(255,255,255,0.22)" : "transparent",
-                color: isSelected ? "#ffffff" : theme.text, pointerEvents: "none",
-              }
-              const brandBox: React.CSSProperties = {
-                position: "absolute", top: 40, right: 10, display: "flex", alignItems: "center", justifyContent: "center",
-                padding: 6, width: 34, height: 34, borderRadius: 10,
-                border: `1px solid ${isSelected ? "rgba(255,255,255,0.6)" : theme.border}`,
-                background: isSelected ? "rgba(255,255,255,0.20)" : darkMode ? "rgba(255,255,255,0.06)" : "rgba(15,23,42,0.03)",
-                color: isSelected ? "#ffffff" : darkMode ? "#e5e7eb" : "#111827",
-                boxShadow: darkMode ? "0 2px 8px rgba(0,0,0,.25)" : "0 2px 8px rgba(0,0,0,.08)",
-                userSelect: "none",
-              }
-              const linkStyle: React.CSSProperties = { ...link, color: isSelected ? "#ffffff" : theme.link }
-
-              return (
-                <li key={key} style={card} onClick={() => toggleSelected(key)} aria-pressed={isSelected}>
-                  <div style={checkBox}>{isSelected ? "✓" : ""}</div>
-                  <div style={brandBox} title="Externe website (binnenkort)" onClick={(e) => e.stopPropagation()}>
-                    <BrandIcon color={isSelected ? "#ffffff" : darkMode ? "#e5e7eb" : "#111827"} />
-                  </div>
-                  <div style={{ fontWeight: 600 }}>{p.name || "Product"}</div>
-                  <div style={{ ...muted, color: isSelected ? "rgba(255,255,255,0.9)" : undefined }}>
-                    {p.category ? `${p.category} • ` : ""}{p.weight_grams ? `${p.weight_grams}g` : "—"}
-                  </div>
-                  {p.url && (
-                    <a href={p.url} target="_blank" rel="noreferrer" style={linkStyle} onClick={(e) => e.stopPropagation()}>
-                      Bekijk product →
-                    </a>
-                  )}
-                </li>
-              )
-            })}
-          </ul>
-        ) : (
-          <div style={{ opacity: 0.6 }}>Nog geen suggesties…</div>
-        )}
-      </div>
-    </div>
-  )
 }
-
-/* ---------- Thema’s & Styles ---------- */
-const light = { bg: "white", text: "#0b0f19", border: "rgba(0,0,0,0.12)", inputBg: "white", buttonBg: "black", buttonText: "white", outputBg: "rgba(0,0,0,0.02)", link: "#111827", errorBg: "rgba(239,68,68,.08)", errorText: "#7f1d1d", errorBorder: "rgba(239,68,68,.35)" }
-const dark  = { bg: "#0f1117", text: "#f3f4f6", border: "rgba(255,255,255,0.15)", inputBg: "#1a1c23", buttonBg: "#f3f4f6", buttonText: "#0f1117", outputBg: "#1a1c23", link: "#93c5fd", errorBg: "rgba(239,68,68,.15)", errorText: "#fee2e2", errorBorder: "rgba(239,68,68,.35)" }
-
-const container: React.CSSProperties = { fontFamily: "Poppins, Inter, system-ui, -apple-system, Segoe UI, Roboto, sans-serif", display: "grid", gap: 14, padding: 16, width: "100%", boxSizing: "border-box", maxWidth: 720, margin: "0 auto", transition: "background 0.3s, color 0.3s" }
-const label: React.CSSProperties = { fontSize: 12, opacity: 0.8 }
-const textareaStyle: React.CSSProperties = { minHeight: 72, padding: "10px 12px", borderRadius: 10, border: "1px solid", outline: "none", fontSize: 14, width: "100%", resize: "vertical" }
-const controlsRow: React.CSSProperties = { display: "flex", gap: 12, alignItems: "center" }
-const btnBase: React.CSSProperties = { height: 36, padding: "0 14px", borderRadius: 10, border: "1px solid transparent", fontSize: 14, cursor: "pointer" }
-const btnDanger: React.CSSProperties = { ...btnBase, background: "#ef4444", color: "white" }
-const btnSecondary = (theme: any): React.CSSProperties => ({
-  ...btnBase,
-  background: theme.bg === "white" ? "#f3f4f6" : "#1f2430",
-  color: theme.text,
-  borderColor: theme.border,
-})
-const sectionTitle: React.CSSProperties = { fontWeight: 600 }
-const outputBox: React.CSSProperties = { minHeight: 160, maxHeight: 520, overflowY: "auto", wordBreak: "break-word", lineHeight: 1.6, padding: 16, borderRadius: 16, border: "1px solid" }
-const productsGrid: React.CSSProperties = { listStyle: "none", padding: 0, margin: 0, display: "grid", gap: 10, gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))" }
-const productCard: React.CSSProperties = { border: "1px solid", borderRadius: 12, padding: 12, display: "grid", gap: 4, minHeight: 84, overflow: "hidden" }
-const muted: React.CSSProperties = { fontSize: 12, opacity: 0.8 }
-const link: React.CSSProperties = { fontSize: 12, textDecoration: "underline" }
-const errorBox: React.CSSProperties = { padding: 10, borderRadius: 10, border: "1px solid" }
-const SELECTED = { bg: "#22c55e", border: "#16a34a" }
