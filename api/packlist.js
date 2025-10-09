@@ -2,16 +2,12 @@
 export const runtime = "edge";
 
 /**
- * Packlist SSE + Slot-Filling Chat Backend (met CORS/OPTIONS)
- * Events: ask, needs, context, start, delta, products, done, error
- * POST Body:
- *   { message?: string, prompt?: string, context?: {...} }
+ * Packlist SSE + Slot-Filling Chat Backend (met CORS/OPTIONS en OpenAI-fallback)
  */
 
 const OPENAI_API_BASE = "https://api.openai.com/v1";
 const OPENAI_MODEL_TEXT = process.env.OPENAI_MODEL_TEXT || "gpt-4o-mini";
 const OPENAI_MODEL_JSON = process.env.OPENAI_MODEL_JSON || "gpt-4o-mini";
-
 const enc = new TextEncoder();
 
 /* --------------------------- CORS helpers --------------------------- */
@@ -28,7 +24,6 @@ const ALLOWED_ORIGINS = [
 
 function originAllowed(origin = "") {
   if (!origin) return false;
-  // wildcard match op volledige origin (scheme+host+poort)
   return ALLOWED_ORIGINS.some((pat) => {
     if (pat.includes("*")) {
       const rx = new RegExp("^" + pat.replace(/\./g, "\\.").replace(/\*/g, ".*") + "$");
@@ -40,7 +35,7 @@ function originAllowed(origin = "") {
 
 function corsHeaders(req) {
   const origin = req.headers.get("origin") || "";
-  const allowOrigin = originAllowed(origin) ? origin : "*"; // desnoods strikter zetten
+  const allowOrigin = originAllowed(origin) ? origin : "*";
   return {
     "Access-Control-Allow-Origin": allowOrigin,
     "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
@@ -101,7 +96,7 @@ export async function POST(req) {
         typeof body?.prompt === "string" && body.prompt.trim().length > 0;
 
       try {
-        // Vrije-tekst modus (slot-filling)
+        // vrije tekst (slot-filling)
         if (!hasDirectPrompt && message) {
           const extracted = await extractSlots({ utterance: message, context: safeContext });
           mergeInto(safeContext, extracted?.context || {});
@@ -125,7 +120,7 @@ export async function POST(req) {
           return;
         }
 
-        // Wizard back-compat (direct generate)
+        // wizard fallback
         const prompt = hasDirectPrompt ? body.prompt.trim() : buildPromptFromContext(safeContext);
         const missing = missingSlots(safeContext);
         if (!hasDirectPrompt && missing.length > 0) {
@@ -153,7 +148,7 @@ export async function POST(req) {
   });
 }
 
-/* -------------------- Slot-filling & context utils -------------------- */
+/* -------------------- Context helpers -------------------- */
 
 function normalizeContext(ctx = {}) {
   const c = typeof ctx === "object" && ctx ? structuredClone(ctx) : {};
@@ -189,6 +184,8 @@ function buildPromptFromContext(ctx) {
   const days = ctx?.durationDays || "?";
   return `Maak een backpack paklijst voor ${days} dagen naar ${where}, ${when}.${acts}`;
 }
+
+/* -------------------- Extraction helpers -------------------- */
 
 async function extractSlots({ utterance, context }) {
   const schema = {
@@ -252,10 +249,10 @@ function mergeInto(target, src) {
 
 async function followupQuestion({ missing, context }) {
   const sys =
-    "Je stelt één korte vervolgvraag in het Nederlands om ontbrekende info te verzamelen. Geen extra uitleg, alleen de vraag.";
+    "Je stelt één korte vervolgvraag in het Nederlands om ontbrekende info te verzamelen. Geen uitleg, alleen de vraag.";
   const user = `Ontbrekend: ${missing.join(
     ", "
-  )}. Voorbeeld mapping: destination.country = "naar welk land ga je (regio optioneel)"; period = "ga je in een specifieke maand of op data?"; durationDays = "hoeveel dagen?". Context: ${JSON.stringify(
+  )}. Voorbeeld mapping: destination.country = 'naar welk land ga je (regio optioneel)'; period = 'ga je in een specifieke maand of op data?'; durationDays = 'hoeveel dagen?'. Context: ${JSON.stringify(
     context
   )}`;
   const out = await chatText(sys, user);
@@ -271,11 +268,10 @@ async function derivedContext(ctx) {
   return json;
 }
 
-/* -------------------- Generation & streaming -------------------- */
+/* -------------------- Generate & Stream -------------------- */
 
 async function generateAndStream({ controller, send, prompt, context }) {
   send("context", await derivedContext(context));
-
   send("start", {});
   try {
     await streamOpenAI({
@@ -291,7 +287,7 @@ async function generateAndStream({ controller, send, prompt, context }) {
   try {
     const products = await suggestProducts(context);
     if (Array.isArray(products) && products.length) send("products", products.slice(0, 24));
-  } catch { /* stil falen oké */ }
+  } catch {}
 
   send("done", {});
   controller.close();
@@ -299,7 +295,7 @@ async function generateAndStream({ controller, send, prompt, context }) {
 
 async function suggestProducts(ctx) {
   const sys =
-    "Je bent een gear advisor. Geef 6-12 korte product-suggesties (geen affiliatelinks) als JSON array met {category,name,weight_grams,activities,seasons,url,image}. Laat onbekend weg.";
+    "Je bent een gear advisor. Geef 6-12 korte product-suggesties (geen affiliatelinks) als JSON array met {category,name,weight_grams,activities,seasons,url,image}.";
   const user = `Context: ${JSON.stringify(ctx)}. Doel: backpack paklijst.`;
   const schema = {
     type: "array",
@@ -321,7 +317,7 @@ async function suggestProducts(ctx) {
   return Array.isArray(arr) ? arr : [];
 }
 
-/* --------------------------- OpenAI wrappers --------------------------- */
+/* -------------------- OpenAI Wrappers (met fallback) -------------------- */
 
 async function chatText(system, user) {
   const res = await fetch(`${OPENAI_API_BASE}/chat/completions`, {
@@ -339,13 +335,18 @@ async function chatText(system, user) {
       temperature: 0.2,
     }),
   });
-  if (!res.ok) throw new Error(`OpenAI text error: ${res.status}`);
+
+  if (!res.ok) {
+    const err = await safeErrorText(res);
+    throw new Error(`OpenAI text error: ${res.status}${err ? ` — ${err}` : ""}`);
+  }
+
   const json = await res.json();
   return json?.choices?.[0]?.message?.content || "";
 }
 
 async function chatJSON(system, user, jsonSchema) {
-  const res = await fetch(`${OPENAI_API_BASE}/chat/completions`, {
+  let res = await fetch(`${OPENAI_API_BASE}/chat/completions`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -364,11 +365,55 @@ async function chatJSON(system, user, jsonSchema) {
       },
     }),
   });
-  if (!res.ok) throw new Error(`OpenAI json error: ${res.status}`);
-  const json = await res.json();
-  const txt = json?.choices?.[0]?.message?.content || "{}";
-  try { return JSON.parse(txt); } catch { return {}; }
+
+  // fallback naar json_object bij 400
+  if (!res.ok && res.status === 400) {
+    res = await fetch(`${OPENAI_API_BASE}/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: OPENAI_MODEL_JSON,
+        messages: [
+          {
+            role: "system",
+            content:
+              "Geef ALLEEN geldige JSON terug, zonder uitleg. Houd je strikt aan het schema.",
+          },
+          { role: "user", content: `${system}\n\n${user}\n\nAntwoord enkel met JSON.` },
+        ],
+        temperature: 0,
+        response_format: { type: "json_object" },
+      }),
+    });
+  }
+
+  if (!res.ok) {
+    const err = await safeErrorText(res);
+    throw new Error(`OpenAI json error: ${res.status}${err ? ` — ${err}` : ""}`);
+  }
+
+  const j = await res.json();
+  const txt = j?.choices?.[0]?.message?.content || "{}";
+  try {
+    return JSON.parse(txt);
+  } catch {
+    return {};
+  }
 }
+
+async function safeErrorText(res) {
+  try {
+    const t = await res.text();
+    return t?.slice(0, 400);
+  } catch {
+    return "";
+  }
+}
+
+/* -------------------- Stream helper -------------------- */
 
 async function streamOpenAI({ prompt, onDelta }) {
   const res = await fetch(`${OPENAI_API_BASE}/chat/completions`, {
@@ -385,7 +430,7 @@ async function streamOpenAI({ prompt, onDelta }) {
         {
           role: "system",
           content:
-            "Je schrijft compacte, praktische paklijsten in het Nederlands. Gebruik duidelijke secties: Korte samenvatting, Kleding, Gear, Gadgets, Health, Tips. Geen overbodige disclaimers.",
+            "Je schrijft compacte, praktische paklijsten in het Nederlands. Gebruik secties: Korte samenvatting, Kleding, Gear, Gadgets, Health, Tips. Geen disclaimers.",
         },
         { role: "user", content: prompt },
       ],
@@ -413,7 +458,7 @@ async function streamOpenAI({ prompt, onDelta }) {
         const json = JSON.parse(data);
         const delta = json?.choices?.[0]?.delta?.content;
         if (delta) onDelta(delta);
-      } catch { /* ignore */ }
+      } catch {}
     }
     buffer = parts[parts.length - 1];
   }
