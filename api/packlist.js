@@ -2,36 +2,77 @@
 export const runtime = "edge";
 
 /**
- * Packlist SSE + Slot-Filling Chat Backend
- * - Vrije-tekst dialoog met "ask" events zolang er velden ontbreken
- * - Wanneer compleet: streamt de paklijst met "start"/"delta"/"done"
- * - Geeft "context" (bv. afgeleid seizoen) en "products" apart terug
- *
+ * Packlist SSE + Slot-Filling Chat Backend (met CORS/OPTIONS)
+ * Events: ask, needs, context, start, delta, products, done, error
  * POST Body:
- *   {
- *     message?: string,           // vrije tekst van gebruiker
- *     prompt?: string,            // directe prompt (wizard back-compat)
- *     context?: {
- *       destination?: { country?: string|null, region?: string|null },
- *       durationDays?: number|null,
- *       startDate?: string|null,  // "YYYY-MM-DD"
- *       endDate?: string|null,    // "YYYY-MM-DD"
- *       month?: string|null,      // "januari" | ... | "december"
- *       activities?: string[]     // ["hiken","duiken"]
- *       preferences?: any|null
- *     }
- *   }
+ *   { message?: string, prompt?: string, context?: {...} }
  */
 
 const OPENAI_API_BASE = "https://api.openai.com/v1";
 const OPENAI_MODEL_TEXT = process.env.OPENAI_MODEL_TEXT || "gpt-4o-mini";
 const OPENAI_MODEL_JSON = process.env.OPENAI_MODEL_JSON || "gpt-4o-mini";
-const ORIGIN = process.env.PUBLIC_ORIGIN || ""; // optioneel voor CORS, indien nodig
 
 const enc = new TextEncoder();
 
+/* --------------------------- CORS helpers --------------------------- */
+
+const ALLOWED_ORIGINS = [
+  "https://*.framer.website",
+  "https://*.framer.app",
+  "https://*.framer.media",
+  "https://*.vercel.app",
+  "https://trekvice.com",
+  "http://localhost:3000",
+  "http://127.0.0.1:3000",
+];
+
+function originAllowed(origin = "") {
+  if (!origin) return false;
+  // wildcard match op volledige origin (scheme+host+poort)
+  return ALLOWED_ORIGINS.some((pat) => {
+    if (pat.includes("*")) {
+      const rx = new RegExp("^" + pat.replace(/\./g, "\\.").replace(/\*/g, ".*") + "$");
+      return rx.test(origin);
+    }
+    return origin === pat;
+  });
+}
+
+function corsHeaders(req) {
+  const origin = req.headers.get("origin") || "";
+  const allowOrigin = originAllowed(origin) ? origin : "*"; // desnoods strikter zetten
+  return {
+    "Access-Control-Allow-Origin": allowOrigin,
+    "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+    "Access-Control-Allow-Credentials": "true",
+  };
+}
+
+export async function OPTIONS(req) {
+  return new Response(null, {
+    status: 204,
+    headers: {
+      ...corsHeaders(req),
+      "Cache-Control": "no-store",
+      "Content-Length": "0",
+    },
+  });
+}
+
+export async function GET(req) {
+  return new Response(JSON.stringify({ ok: true }), {
+    status: 200,
+    headers: {
+      "Content-Type": "application/json",
+      ...corsHeaders(req),
+    },
+  });
+}
+
+/* ------------------------------ POST ------------------------------- */
+
 export async function POST(req) {
-  // SSE stream
   const stream = new ReadableStream({
     async start(controller) {
       const send = (event, data) => {
@@ -42,8 +83,7 @@ export async function POST(req) {
               `data: ${typeof data === "string" ? data : JSON.stringify(data)}\n\n`;
         controller.enqueue(enc.encode(payload));
       };
-
-      const closeWithError = (msg, status = 500) => {
+      const closeWithError = (msg) => {
         try { send("error", { message: msg }); } catch {}
         controller.close();
       };
@@ -55,22 +95,19 @@ export async function POST(req) {
         return closeWithError("Invalid JSON body");
       }
 
-      // ---- Helpers ---------------------------------------------------------
       const safeContext = normalizeContext(body?.context);
       const message = (body?.message || "").trim();
-      const hasDirectPrompt = typeof body?.prompt === "string" && body.prompt.trim().length > 0;
+      const hasDirectPrompt =
+        typeof body?.prompt === "string" && body.prompt.trim().length > 0;
 
       try {
-        // 1) SLOT-FILLING LOOP (alleen bij vrije tekst)
+        // Vrije-tekst modus (slot-filling)
         if (!hasDirectPrompt && message) {
-          // Probeer velden te extraheren uit de laatste user zin + huidige context
           const extracted = await extractSlots({ utterance: message, context: safeContext });
           mergeInto(safeContext, extracted?.context || {});
-
-          // Check missende slots
           const missing = missingSlots(safeContext);
+
           if (missing.length > 0) {
-            // Formuleer vervolgvraag server-side (zodat UI dumb kan blijven)
             const followupQ = await followupQuestion({ missing, context: safeContext });
             send("needs", { missing, contextOut: safeContext });
             send("ask", { question: followupQ, missing });
@@ -79,7 +116,6 @@ export async function POST(req) {
             return;
           }
 
-          // Alles aanwezig → ga genereren
           await generateAndStream({
             controller,
             send,
@@ -89,23 +125,17 @@ export async function POST(req) {
           return;
         }
 
-        // 2) BACKWARDS COMPAT: wizard-pad
+        // Wizard back-compat (direct generate)
         const prompt = hasDirectPrompt ? body.prompt.trim() : buildPromptFromContext(safeContext);
         const missing = missingSlots(safeContext);
         if (!hasDirectPrompt && missing.length > 0) {
-          // Wizard stuurde nog te weinig → zelfde gedrag als voorheen
           send("needs", { missing, contextOut: safeContext });
           send("context", await derivedContext(safeContext));
           controller.close();
           return;
         }
 
-        await generateAndStream({
-          controller,
-          send,
-          prompt,
-          context: safeContext,
-        });
+        await generateAndStream({ controller, send, prompt, context: safeContext });
       } catch (e) {
         closeWithError(e?.message || "Onbekende fout");
       }
@@ -118,18 +148,17 @@ export async function POST(req) {
       "Content-Type": "text/event-stream; charset=utf-8",
       "Cache-Control": "no-cache, no-transform",
       Connection: "keep-alive",
-      "Access-Control-Allow-Origin": ORIGIN || "*", // pas aan indien nodig
+      ...corsHeaders(req),
     },
   });
 }
 
-// --------------------------- Slot-filling helpers ---------------------------
+/* -------------------- Slot-filling & context utils -------------------- */
 
 function normalizeContext(ctx = {}) {
   const c = typeof ctx === "object" && ctx ? structuredClone(ctx) : {};
   c.destination = c.destination || {};
   if (c.activities && !Array.isArray(c.activities)) {
-    // accepteer komma-gescheiden string
     c.activities = String(c.activities)
       .split(",")
       .map((s) => s.trim())
@@ -137,6 +166,7 @@ function normalizeContext(ctx = {}) {
   }
   ensureKeys(c, ["durationDays", "startDate", "endDate", "month", "preferences"]);
   ensureKeys(c.destination, ["country", "region"]);
+  c.activities = Array.isArray(c.activities) ? c.activities : [];
   return c;
 }
 function ensureKeys(o, keys) { for (const k of keys) if (!(k in o)) o[k] = null; }
@@ -145,24 +175,22 @@ function missingSlots(ctx) {
   const missing = [];
   if (!ctx?.durationDays || ctx.durationDays < 1) missing.push("durationDays");
   if (!ctx?.destination?.country) missing.push("destination.country");
-  // Periode: óf maand óf start+end
   if (!ctx?.month && !(ctx?.startDate && ctx?.endDate)) missing.push("period");
-  // activiteiten optioneel → laat weg
   return missing;
 }
 
 function buildPromptFromContext(ctx) {
   const where = [ctx?.destination?.country, ctx?.destination?.region].filter(Boolean).join(" - ") || "?";
-  const when = ctx?.month
-    ? `in ${ctx.month}`
-    : `${ctx?.startDate || "?"} t/m ${ctx?.endDate || "?"}`;
-  const acts = Array.isArray(ctx?.activities) && ctx.activities.length ? ` Activiteiten: ${ctx.activities.join(", ")}.` : "";
+  const when = ctx?.month ? `in ${ctx.month}` : `${ctx?.startDate || "?"} t/m ${ctx?.endDate || "?"}`;
+  const acts =
+    Array.isArray(ctx?.activities) && ctx.activities.length
+      ? ` Activiteiten: ${ctx.activities.join(", ")}.`
+      : "";
   const days = ctx?.durationDays || "?";
   return `Maak een backpack paklijst voor ${days} dagen naar ${where}, ${when}.${acts}`;
 }
 
 async function extractSlots({ utterance, context }) {
-  // JSON-only extractie, model mag GEEN vrije tekst teruggeven
   const schema = {
     type: "object",
     properties: {
@@ -181,10 +209,7 @@ async function extractSlots({ utterance, context }) {
           startDate: { type: ["string", "null"] },
           endDate: { type: ["string", "null"] },
           month: { type: ["string", "null"] },
-          activities: {
-            type: "array",
-            items: { type: "string" },
-          },
+          activities: { type: "array", items: { type: "string" } },
           preferences: {},
         },
         required: ["durationDays", "destination", "startDate", "endDate", "month", "activities", "preferences"],
@@ -195,9 +220,9 @@ async function extractSlots({ utterance, context }) {
   };
 
   const sys = [
-    "Je bent een NLU-extractor. Geef ALLEEN JSON dat dit schema volgt.",
+    "Je bent een NLU-extractor. Geef ALLEEN JSON dat het schema volgt.",
     "Zet maanden om naar kleine letters Nederlands (januari..december).",
-    "durationDays is geheel aantal dagen indien gezegd (\"2w\" = 14).",
+    "durationDays is geheel aantal dagen (\"2w\" = 14).",
     "Haal landen/regio's uit de tekst. Activities als lijst, zonder duplicaten.",
     "Als iets niet genoemd is, zet het veld op null (niet raden).",
   ].join(" ");
@@ -241,22 +266,16 @@ async function derivedContext(ctx) {
   const sys =
     "Bepaal, indien mogelijk, het seizoen (winter/lente/zomer/herfst of tropisch nat/droog) op basis van land/maand of data. Kort antwoord, alleen het veld 'season'. Geef JSON.";
   const user = `Context: ${JSON.stringify(ctx)}.`;
-  const schema = {
-    type: "object",
-    properties: { season: { type: ["string", "null"] } },
-    required: ["season"],
-  };
+  const schema = { type: "object", properties: { season: { type: ["string", "null"] } }, required: ["season"] };
   const json = await chatJSON(sys, user, schema);
   return json;
 }
 
-// --------------------------- Generation & streaming -------------------------
+/* -------------------- Generation & streaming -------------------- */
 
 async function generateAndStream({ controller, send, prompt, context }) {
-  // Stuur context terug (bijv. season hint)
   send("context", await derivedContext(context));
 
-  // Start streaming van de hoofdtekst
   send("start", {});
   try {
     await streamOpenAI({
@@ -269,13 +288,10 @@ async function generateAndStream({ controller, send, prompt, context }) {
     return;
   }
 
-  // Product-suggesties
   try {
     const products = await suggestProducts(context);
     if (Array.isArray(products) && products.length) send("products", products.slice(0, 24));
-  } catch {
-    // stil falen is oké voor products
-  }
+  } catch { /* stil falen oké */ }
 
   send("done", {});
   controller.close();
@@ -283,7 +299,7 @@ async function generateAndStream({ controller, send, prompt, context }) {
 
 async function suggestProducts(ctx) {
   const sys =
-    "Je bent een gear advisor. Geef 6-12 korte product-suggesties (geen affiliatelinks) als JSON array met {category,name,weight_grams,activities,seasons,url}. Vul onbekend niet in of laat weg. Korte, generieke namen zijn oké.";
+    "Je bent een gear advisor. Geef 6-12 korte product-suggesties (geen affiliatelinks) als JSON array met {category,name,weight_grams,activities,seasons,url,image}. Laat onbekend weg.";
   const user = `Context: ${JSON.stringify(ctx)}. Doel: backpack paklijst.`;
   const schema = {
     type: "array",
@@ -305,7 +321,7 @@ async function suggestProducts(ctx) {
   return Array.isArray(arr) ? arr : [];
 }
 
-// --------------------------- OpenAI wrappers --------------------------------
+/* --------------------------- OpenAI wrappers --------------------------- */
 
 async function chatText(system, user) {
   const res = await fetch(`${OPENAI_API_BASE}/chat/completions`, {
@@ -344,26 +360,17 @@ async function chatJSON(system, user, jsonSchema) {
       temperature: 0,
       response_format: {
         type: "json_schema",
-        json_schema: {
-          name: "extraction",
-          schema: jsonSchema,
-          strict: true,
-        },
+        json_schema: { name: "extraction", schema: jsonSchema, strict: true },
       },
     }),
   });
   if (!res.ok) throw new Error(`OpenAI json error: ${res.status}`);
   const json = await res.json();
   const txt = json?.choices?.[0]?.message?.content || "{}";
-  try {
-    return JSON.parse(txt);
-  } catch {
-    return {};
-  }
+  try { return JSON.parse(txt); } catch { return {}; }
 }
 
 async function streamOpenAI({ prompt, onDelta }) {
-  // Streaming text als platte delta-chunks
   const res = await fetch(`${OPENAI_API_BASE}/chat/completions`, {
     method: "POST",
     headers: {
@@ -395,7 +402,6 @@ async function streamOpenAI({ prompt, onDelta }) {
     if (done) break;
     buffer += decoder.decode(value, { stream: true });
 
-    // OpenAI streams met "data: ..." lijnen (SSE)
     const parts = buffer.split("\n\n");
     for (let i = 0; i < parts.length - 1; i++) {
       const block = parts[i];
@@ -407,9 +413,7 @@ async function streamOpenAI({ prompt, onDelta }) {
         const json = JSON.parse(data);
         const delta = json?.choices?.[0]?.delta?.content;
         if (delta) onDelta(delta);
-      } catch {
-        // negeren
-      }
+      } catch { /* ignore */ }
     }
     buffer = parts[parts.length - 1];
   }
