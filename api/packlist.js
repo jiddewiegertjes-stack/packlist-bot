@@ -2,7 +2,11 @@
 export const runtime = "edge";
 
 /**
- * Packlist SSE + Slot-Filling Chat Backend (met CORS/OPTIONS en OpenAI-fallback)
+ * Packlist SSE + Slot-Filling Chat Backend
+ * - CORS/OPTIONS fix
+ * - Deterministische vervolgvragen op missende velden
+ * - Extra context-event na done (voor 'geheugen' aan UI-kant)
+ * - OpenAI JSON-fallback (json_schema -> json_object)
  */
 
 const OPENAI_API_BASE = "https://api.openai.com/v1";
@@ -96,14 +100,14 @@ export async function POST(req) {
         typeof body?.prompt === "string" && body.prompt.trim().length > 0;
 
       try {
-        // vrije tekst (slot-filling)
+        // Vrije-tekst modus (slot-filling)
         if (!hasDirectPrompt && message) {
           const extracted = await extractSlots({ utterance: message, context: safeContext });
           mergeInto(safeContext, extracted?.context || {});
           const missing = missingSlots(safeContext);
 
           if (missing.length > 0) {
-            const followupQ = await followupQuestion({ missing, context: safeContext });
+            const followupQ = followupQuestion({ missing, context: safeContext });
             send("needs", { missing, contextOut: safeContext });
             send("ask", { question: followupQ, missing });
             send("context", await derivedContext(safeContext));
@@ -120,11 +124,13 @@ export async function POST(req) {
           return;
         }
 
-        // wizard fallback
+        // Wizard back-compat (direct genereren)
         const prompt = hasDirectPrompt ? body.prompt.trim() : buildPromptFromContext(safeContext);
         const missing = missingSlots(safeContext);
         if (!hasDirectPrompt && missing.length > 0) {
+          const followupQ = followupQuestion({ missing, context: safeContext });
           send("needs", { missing, contextOut: safeContext });
+          send("ask", { question: followupQ, missing });
           send("context", await derivedContext(safeContext));
           controller.close();
           return;
@@ -247,17 +253,24 @@ function mergeInto(target, src) {
   }
 }
 
-async function followupQuestion({ missing, context }) {
-  const sys =
-    "Je stelt één korte vervolgvraag in het Nederlands om ontbrekende info te verzamelen. Geen uitleg, alleen de vraag.";
-  const user = `Ontbrekend: ${missing.join(
-    ", "
-  )}. Voorbeeld mapping: destination.country = 'naar welk land ga je (regio optioneel)'; period = 'ga je in een specifieke maand of op data?'; durationDays = 'hoeveel dagen?'. Context: ${JSON.stringify(
-    context
-  )}`;
-  const out = await chatText(sys, user);
-  return (out || "Welke info mis ik nog?").trim();
+/* -------------------- Vervolgvraag (deterministisch) -------------------- */
+
+function followupQuestion({ missing, context }) {
+  const labels = [];
+  if (missing.includes("destination.country")) labels.push("bestemming (land, optioneel regio)");
+  if (missing.includes("durationDays")) labels.push("hoeveel dagen");
+  if (missing.includes("period")) labels.push("in welke periode (maand of exacte data)");
+  // eventueel hint met al bekende context
+  const pref = [];
+  if (context?.destination?.country) pref.push(`bestemming: ${context.destination.country}`);
+  if (context?.durationDays) pref.push(`duur: ${context.durationDays} dagen`);
+  if (context?.month) pref.push(`maand: ${context.month}`);
+  if (context?.startDate && context?.endDate) pref.push(`data: ${context.startDate} t/m ${context.endDate}`);
+  const hint = pref.length ? ` (bekend: ${pref.join(", ")})` : "";
+  return `Kun je nog aangeven: ${labels.join(", ")}?${hint}`;
 }
+
+/* -------------------- Afgeleide context -------------------- */
 
 async function derivedContext(ctx) {
   const sys =
@@ -271,7 +284,9 @@ async function derivedContext(ctx) {
 /* -------------------- Generate & Stream -------------------- */
 
 async function generateAndStream({ controller, send, prompt, context }) {
-  send("context", await derivedContext(context));
+  const derived = await derivedContext(context);
+  send("context", derived);
+
   send("start", {});
   try {
     await streamOpenAI({
@@ -289,6 +304,9 @@ async function generateAndStream({ controller, send, prompt, context }) {
     if (Array.isArray(products) && products.length) send("products", products.slice(0, 24));
   } catch {}
 
+  // ⬇️ stuur de (mogelijk verrijkte) context nogmaals terug,
+  // zodat de UI altijd de laatste state heeft en kan 'doorbouwen'
+  send("context", { ...derived });
   send("done", {});
   controller.close();
 }
@@ -346,6 +364,7 @@ async function chatText(system, user) {
 }
 
 async function chatJSON(system, user, jsonSchema) {
+  // 1) Probeer json_schema
   let res = await fetch(`${OPENAI_API_BASE}/chat/completions`, {
     method: "POST",
     headers: {
@@ -366,7 +385,7 @@ async function chatJSON(system, user, jsonSchema) {
     }),
   });
 
-  // fallback naar json_object bij 400
+  // 2) Fallback naar json_object bij 400
   if (!res.ok && res.status === 400) {
     res = await fetch(`${OPENAI_API_BASE}/chat/completions`, {
       method: "POST",
@@ -380,9 +399,9 @@ async function chatJSON(system, user, jsonSchema) {
           {
             role: "system",
             content:
-              "Geef ALLEEN geldige JSON terug, zonder uitleg. Houd je strikt aan het schema.",
+              "Geef ALLEEN geldige JSON terug, zonder tekst of uitleg. Houd je strikt aan het gevraagde schema; ontbrekend = null/lege waarde.",
           },
-          { role: "user", content: `${system}\n\n${user}\n\nAntwoord enkel met JSON.` },
+          { role: "user", content: `${system}\n\n${user}\n\nAntwoord uitsluitend met JSON.` },
         ],
         temperature: 0,
         response_format: { type: "json_object" },
@@ -413,7 +432,7 @@ async function safeErrorText(res) {
   }
 }
 
-/* -------------------- Stream helper -------------------- */
+/* -------------------- Streaming helper -------------------- */
 
 async function streamOpenAI({ prompt, onDelta }) {
   const res = await fetch(`${OPENAI_API_BASE}/chat/completions`, {
