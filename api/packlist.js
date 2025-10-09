@@ -1,544 +1,416 @@
 // app/api/packlist/route.js
-export const runtime = "nodejs";
-export const dynamic = "force-dynamic";
+export const runtime = "edge";
 
-/* ---------------- CORS ---------------- */
-function buildCorsHeaders(req) {
-  const origin = req.headers.get("origin") || "*";
-  const reqHdr = req.headers.get("access-control-request-headers");
-  return {
-    "Access-Control-Allow-Origin": origin,
-    "Vary": "Origin",
-    "Access-Control-Allow-Methods": "GET,POST,OPTIONS,HEAD",
-    "Access-Control-Allow-Headers": reqHdr || "Content-Type, Authorization, Accept",
-    "Access-Control-Max-Age": "86400",
-  };
-}
-function withCors(req, init = {}) {
-  const headers = new Headers(init.headers || {});
-  Object.entries(buildCorsHeaders(req)).forEach(([k, v]) => headers.set(k, v));
-  return new Response(init.body ?? null, { ...init, headers });
-}
+/**
+ * Packlist SSE + Slot-Filling Chat Backend
+ * - Vrije-tekst dialoog met "ask" events zolang er velden ontbreken
+ * - Wanneer compleet: streamt de paklijst met "start"/"delta"/"done"
+ * - Geeft "context" (bv. afgeleid seizoen) en "products" apart terug
+ *
+ * POST Body:
+ *   {
+ *     message?: string,           // vrije tekst van gebruiker
+ *     prompt?: string,            // directe prompt (wizard back-compat)
+ *     context?: {
+ *       destination?: { country?: string|null, region?: string|null },
+ *       durationDays?: number|null,
+ *       startDate?: string|null,  // "YYYY-MM-DD"
+ *       endDate?: string|null,    // "YYYY-MM-DD"
+ *       month?: string|null,      // "januari" | ... | "december"
+ *       activities?: string[]     // ["hiken","duiken"]
+ *       preferences?: any|null
+ *     }
+ *   }
+ */
 
-/* ---------------- SSE ---------------- */
-function sseEncode(event) {
-  let s = "";
-  if (event.comment) s += `: ${event.comment}\n`;
-  if (event.event) s += `event: ${event.event}\n`;
-  if (event.data !== undefined) {
-    const payload = typeof event.data === "string" ? event.data : JSON.stringify(event.data);
-    s += `data: ${payload}\n`;
-  }
-  return s + "\n";
-}
-function sseHeaders(req) {
-  return {
-    ...buildCorsHeaders(req),
-    "Content-Type": "text/event-stream; charset=utf-8",
-    "Cache-Control": "no-cache, no-transform",
-    "Connection": "keep-alive",
-    "X-Accel-Buffering": "no",
-  };
-}
+const OPENAI_API_BASE = "https://api.openai.com/v1";
+const OPENAI_MODEL_TEXT = process.env.OPENAI_MODEL_TEXT || "gpt-4o-mini";
+const OPENAI_MODEL_JSON = process.env.OPENAI_MODEL_JSON || "gpt-4o-mini";
+const ORIGIN = process.env.PUBLIC_ORIGIN || ""; // optioneel voor CORS, indien nodig
 
-/* ---------------- Config ---------------- */
-const MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
-const CSV_URL = process.env.CSV_URL;
-const SEASONS_URL = process.env.SEASONS_URL || null;
-
-/* ---------------- CSV mini parser ---------------- */
-function parseCsv(text) {
-  const rows = [];
-  let i = 0, field = "", row = [], inQuotes = false;
-  const pf = () => { row.push(field); field = ""; };
-  const pr = () => { rows.push(row); row = []; };
-  while (i < text.length) {
-    const c = text[i];
-    if (inQuotes) {
-      if (c === '"') { if (text[i + 1] === '"') { field += '"'; i += 2; continue; } inQuotes = false; i++; continue; }
-      field += c; i++; continue;
-    }
-    if (c === '"') { inQuotes = true; i++; continue; }
-    if (c === ",") { pf(); i++; continue; }
-    if (c === "\n") { pf(); pr(); i++; continue; }
-    if (c === "\r") { i++; continue; }
-    field += c; i++;
-  }
-  pf(); if (row.length > 1 || (row.length === 1 && row[0] !== "")) pr();
-  if (!rows.length) return [];
-  const hdr = rows[0].map((h) => String(h || "").trim());
-  return rows.slice(1).map((r) => Object.fromEntries(hdr.map((h, j) => [h, (r[j] ?? "").toString().trim()])));
-}
-
-/* ---------------- Products ---------------- */
-let __csvCache = { at: 0, data: [] };
-async function getCsvProducts(force = false) {
-  const TTL = 5 * 60 * 1000;
-  if (!force && Date.now() - __csvCache.at < TTL && __csvCache.data.length) return __csvCache.data;
-  if (!CSV_URL) throw new Error("CSV_URL ontbreekt in env.");
-  const r = await fetch(CSV_URL);
-  if (!r.ok) throw new Error(`CSV download failed: ${r.status} ${r.statusText}`);
-  const text = await r.text();
-  const rows = parseCsv(text);
-  const products = rows.map((r) => ({
-    category: r.category || r.Category || "",
-    name: r.name || r.Product || r.Title || "",
-    weight_grams: Number(r.weight_grams || r.Weight || 0) || 0,
-    seasons: (r.seasons || r.Seasons || "all").toLowerCase(),
-    activities: (r.activities || r.Activities || "").toLowerCase(),
-    url: r.url || r.Link || r.URL || "",
-    image: r.image || r.Image || "",
-    raw: r,
-  }));
-  __csvCache = { at: Date.now(), data: products };
-  return products;
-}
-function filterProducts(products, { activities = [], season = "all", maxWeight = 4000 }) {
-  const acts = activities.map((a) => a.toLowerCase());
-  const seasonKey = String(season || "all").toLowerCase();
-  let list = products.slice();
-  if (acts.length) list = list.filter((p) => !p.activities || acts.some((a) => p.activities.includes(a)));
-  if (seasonKey !== "all") list = list.filter((p) => !p.seasons || p.seasons.includes(seasonKey) || p.seasons.includes("all"));
-  if (maxWeight) list = list.filter((p) => p.weight_grams <= maxWeight || !p.weight_grams);
-  list.sort((a, b) => (a.weight_grams || 999999) - (b.weight_grams || 999999));
-  return list;
-}
-
-/* ---------------- Seasons (optional) ---------------- */
-let __seasonsCache = { at: 0, data: null };
-async function loadSeasons(force = false) {
-  if (!SEASONS_URL) return null;
-  const TTL = 5 * 60 * 1000;
-  if (!force && __seasonsCache.data && Date.now() - __seasonsCache.at < TTL) return __seasonsCache.data;
-  const r = await fetch(SEASONS_URL);
-  if (!r.ok) throw new Error(`SEASONS_URL fetch failed: ${r.status} ${r.statusText}`);
-  const ct = (r.headers.get("content-type") || "").toLowerCase();
-  let data;
-  if (ct.includes("application/json")) data = await r.json();
-  else {
-    const text = await r.text();
-    data = normalizeSeasonsCSV(parseCsv(text));
-  }
-  __seasonsCache = { at: Date.now(), data };
-  return data;
-}
-function normalizeSeasonsCSV(rows) {
-  const byKey = new Map();
-  for (const r of rows) {
-    const country = (r.country || r.Country || "").trim();
-    const region = (r.region || r.Region || "").trim() || null;
-    const months = String(r.months || r.Months || "")
-      .split("|")
-      .map((s) => parseInt(String(s).trim(), 10))
-      .filter(Boolean);
-    const season = (r.season || r.Season || "").trim().toLowerCase() || "all";
-    if (!country || !months.length) continue;
-    const key = country.toLowerCase() + "||" + (region ? region.toLowerCase() : "");
-    if (!byKey.has(key)) byKey.set(key, { country, region, rules: [] });
-    byKey.get(key).rules.push({ months, season });
-  }
-  return Array.from(byKey.values());
-}
-function monthFromDate(iso) { try { return iso ? new Date(iso).getUTCMonth() + 1 : null; } catch { return null; } }
-function inferSeasonForTrip({ seasonsData, country, region, startDate, endDate }) {
-  if (!seasonsData || !country) return "all";
-  const mm = monthFromDate(startDate || endDate);
-  if (!mm) return "all";
-  const lcC = country.toLowerCase();
-  const lcR = region ? region.toLowerCase() : null;
-  const match =
-    (lcR && seasonsData.find((s) => s.country?.toLowerCase() === lcC && s.region?.toLowerCase() === lcR)) ||
-    seasonsData.find((s) => s.country?.toLowerCase() === lcC && !s.region);
-  const found = match?.rules?.find((r) => r.months?.includes(mm));
-  return found?.season || "all";
-}
-
-/* ---------------- Time utils ---------------- */
-function safeDateISO(d) {
-  const y = d.getUTCFullYear(), m = String(d.getUTCMonth() + 1).padStart(2, "0"), day = String(d.getUTCDate()).padStart(2, "0");
-  return `${y}-${m}-${day}`;
-}
-function diffDaysInclusive(aISO, bISO) {
-  const a = new Date(aISO), b = new Date(bISO);
-  const utcA = Date.UTC(a.getUTCFullYear(), a.getUTCMonth(), a.getUTCDate());
-  const utcB = Date.UTC(b.getUTCFullYear(), b.getUTCMonth(), b.getUTCDate());
-  return Math.max(1, Math.round((utcB - utcA) / 86400000) + 1);
-}
-function parseMonthName(nl) {
-  const t = (nl || "").toLowerCase().trim();
-  const map = {
-    jan: 1, januari: 1, feb: 2, februari: 2, mrt: 3, maart: 3, apr: 4, april: 4,
-    mei: 5, jun: 6, juni: 6, jul: 7, juli: 7, aug: 8, augustus: 8, sep: 9, sept: 9, september: 9,
-    okt: 10, oktober: 10, nov: 11, november: 11, dec: 12, december: 12,
-  };
-  return map[t] || null;
-}
-
-/* ---------------- Regex extractie (fallback vóór LLM) ---------------- */
-function regexExtract(prompt) {
-  const p = prompt.replace(/\s+/g, " ").trim().toLowerCase();
-
-  // duur
-  let durationDays = null;
-  const mDays = p.match(/(\d+)\s*(dag|dagen)\b/);
-  const mWeeks = p.match(/(\d+)\s*(week|weken)\b/);
-  const mMonths = p.match(/(\d+)\s*(maand|maanden)\b/);
-  if (mDays) durationDays = parseInt(mDays[1], 10);
-  else if (mWeeks) durationDays = parseInt(mWeeks[1], 10) * 7;
-  else if (mMonths) durationDays = parseInt(mMonths[1], 10) * 30;
-
-  // maand
-  let month = null;
-  const allMonths = ["januari","februari","maart","april","mei","juni","juli","augustus","september","oktober","november","december",
-    "jan","feb","mrt","apr","jun","jul","aug","sep","sept","okt","nov","dec"];
-  for (const m of allMonths) {
-    if (p.includes(` ${m} `) || p.endsWith(` ${m}`)) { month = m; break; }
-  }
-
-  // data (dd-mm-yyyy / dd/mm/yyyy)
-  let startDate = null, endDate = null;
-  const mDate = p.match(/(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})/);
-  if (mDate) {
-    const d = parseInt(mDate[1], 10), mo = parseInt(mDate[2], 10), y = parseInt(mDate[3].length === 2 ? "20"+mDate[3] : mDate[3], 10);
-    startDate = safeDateISO(new Date(Date.UTC(y, mo - 1, d)));
-  }
-
-  // bestemming "naar X" / "in X"
-  let country = null;
-  const mDest = p.match(/(?:naar|richting|to)\s+([a-zà-ÿ'’\-\s]+)/i) || p.match(/(?:in)\s+([a-zà-ÿ'’\-\s]+)/i);
-  if (mDest) {
-    // pak tot aan eerste punt/comma/voorzetsel
-    country = mDest[1].split(/[,.;]| met | voor | en /)[0].trim();
-    country = country.replace(/\s{2,}/g, " ").trim();
-    if (country) country = country.replace(/^\bde\b\s+/i, ""); // "de VS" → "VS" (grove)
-  }
-
-  // activiteiten (lichte set)
-  const actLex = ["hike","hiken","wandelen","trekking","duiken","snorkelen","surfen","skiën","kamperen","backpacken","klimmen","trailrun"];
-  const activities = actLex.filter((w) => p.includes(w)).map((w) => w.replace("hike","hiken"));
-
-  return {
-    destination: { country: country || null, region: null },
-    durationDays: durationDays || null,
-    startDate, endDate, month,
-    activities,
-    preferences: null,
-  };
-}
-
-/* ---------------- LLM helpers ---------------- */
-async function extractTripFactsWithLLM(openai, prompt) {
-  const sys = `Je krijgt een Nederlandse prompt over een reis. Antwoord ALLEEN met JSON.
-Velden:
-- destination: { country: string|null, region: string|null }
-- durationDays: int|null
-- startDate: YYYY-MM-DD|null
-- endDate: YYYY-MM-DD|null
-- month: string|null
-- activities: string[]
-- preferences: object|null`;
-  const user = `Prompt: """${prompt}"""`;
-  const r = await openai.chat.completions.create({
-    model: MODEL, temperature: 0,
-    messages: [{ role: "system", content: sys }, { role: "user", content: user }],
-  });
-  try { return JSON.parse(r.choices?.[0]?.message?.content?.trim() || "{}"); }
-  catch { return {}; }
-}
-
-function mergeContext(a = {}, b = {}) {
-  return {
-    destination: {
-      country: a?.destination?.country || b?.destination?.country || null,
-      region: a?.destination?.region || b?.destination?.region || null,
-    },
-    startDate: a?.startDate || b?.startDate || null,
-    endDate: a?.endDate || b?.endDate || null,
-    durationDays: a?.durationDays || b?.durationDays || null,
-    month: a?.month || b?.month || null,
-    activities: Array.from(new Set([...(a?.activities || []), ...(b?.activities || [])])),
-    preferences: { ...(b?.preferences || {}), ...(a?.preferences || {}) },
-  };
-}
-function normalizeDates(ctx) {
-  let { startDate, endDate, durationDays, month } = ctx;
-  if (startDate && durationDays && !endDate) {
-    const s = new Date(startDate); endDate = safeDateISO(new Date(s.getTime() + (durationDays - 1) * 86400000));
-  } else if (endDate && durationDays && !startDate) {
-    const e = new Date(endDate); startDate = safeDateISO(new Date(e.getTime() - (durationDays - 1) * 86400000));
-  } else if (!startDate && !endDate && durationDays && month) {
-    const m = parseMonthName(month); if (m) {
-      const now = new Date(); const thisM = now.getUTCMonth() + 1;
-      const year = m <= thisM ? now.getUTCFullYear() + 1 : now.getUTCFullYear();
-      const s = new Date(Date.UTC(year, m - 1, 1));
-      const e = new Date(s.getTime() + (durationDays - 1) * 86400000);
-      startDate = safeDateISO(s); endDate = safeDateISO(e);
-    }
-  }
-  const dur = durationDays || (startDate && endDate ? diffDaysInclusive(startDate, endDate) : undefined);
-  return { ...ctx, startDate, endDate, durationDays: dur };
-}
-
-/* ✅ Losser: genoeg als (bestemming) én (duur OF datumcombi OF maand+duur); maand zonder duur → default 14 */
-function fillDefaultsAndFindMissing(ctx) {
-  const out = { ...ctx };
-  const hasDest = !!out?.destination?.country;
-  const hasDur = !!out?.durationDays;
-  const hasStart = !!out?.startDate;
-  const hasEnd = !!out?.endDate;
-  const hasMonth = !!out?.month;
-
-  if (!hasDur && hasMonth) out.durationDays = 14; // default
-
-  const okTime =
-    out.durationDays ||
-    (hasStart && hasEnd) ||
-    (hasStart && out.durationDays) ||
-    (hasMonth && out.durationDays);
-
-  const missing = [];
-  if (!hasDest) missing.push("destination.country");
-  if (!okTime) missing.push("period");
-
-  return { ctx: out, missing };
-}
-
-function followUpText(missing) {
-  const parts = [];
-  if (missing.includes("destination.country")) parts.push("land (en evt. regio)");
-  if (missing.includes("period")) parts.push("duur + (startdatum of maand)");
-  return `Helder! Kun je nog aangeven: ${parts.join(" en ")}? Bijvoorbeeld: "20 dagen in juli naar Indonesië".`;
-}
-
-/* ---------------- System prompt advies ---------------- */
-const SYS_ADVICE = String.raw`Je bent een ervaren backpack-expert. Je maakt een minimalistische maar complete paklijst
-die rekening houdt met duur, bestemming(en), activiteiten en seizoen. Schrijf in het Nederlands.
-
-1) **Korte samenvatting** – 3–5 bullets met omstandigheden en strategie.
-2) **De paklijst** – secties **Kleding**, **Gear**, **Gadgets**, **Health**, **Tips** met concrete items en aantallen.
-Alleen Markdown. Stream complete zinnen/bullets.`;
-
-/* ---------------- Routes ---------------- */
-export async function OPTIONS(req) { return withCors(req, { status: 204 }); }
-export async function GET(req) {
-  return withCors(req, {
-    status: 200,
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ ok: true, hint: "POST { prompt, context? }  (stream met ?stream=1). Back-compat: { activities, durationDays, season }." }),
-  });
-}
+const enc = new TextEncoder();
 
 export async function POST(req) {
-  const url = new URL(req.url);
-  const wantStream = url.searchParams.get("stream") === "1" || url.searchParams.get("s") === "1";
-  let body = {}; try { body = await req.json(); } catch { body = {}; }
+  // SSE stream
+  const stream = new ReadableStream({
+    async start(controller) {
+      const send = (event, data) => {
+        const payload =
+          data === undefined
+            ? `event: ${event}\n\n`
+            : `event: ${event}\n` +
+              `data: ${typeof data === "string" ? data : JSON.stringify(data)}\n\n`;
+        controller.enqueue(enc.encode(payload));
+      };
 
-  /* ---------- Prompt-modus ---------- */
-  if (typeof body?.prompt === "string" && body.prompt.trim()) {
-    if (!process.env.OPENAI_API_KEY)
-      return withCors(req, { status: 500, body: JSON.stringify({ ok: false, error: "OPENAI_API_KEY ontbreekt in env." }) });
+      const closeWithError = (msg, status = 500) => {
+        try { send("error", { message: msg }); } catch {}
+        controller.close();
+      };
 
-    let OpenAI; try { ({ default: OpenAI } = await import("openai")); }
-    catch (e) { return withCors(req, { status: 500, body: JSON.stringify({ ok: false, error: "OPENAI_PKG_ERROR", details: String(e?.message || e) }) }); }
-    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-
-    const userPrompt = body.prompt.trim();
-    const ctxClient = body.context || {};
-
-    // ⛳ 1) regex → 2) LLM → 3) merge met client
-    const rx = regexExtract(userPrompt);
-    const llm = await extractTripFactsWithLLM(openai, userPrompt);
-    const merged = mergeContext(mergeContext(ctxClient, rx), llm);
-
-    // normaliseer & defaults/missing
-    const norm = normalizeDates(merged);
-    const { ctx: ready, missing } = fillDefaultsAndFindMissing(norm);
-
-    if (!wantStream) {
-      if (missing.length) {
-        return withCors(req, {
-          status: 200,
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ ok: true, needs: { missing, contextOut: ready } }),
-        });
-      }
-      // advies + producten (1-shot)
+      let body;
       try {
-        const seasonsData = await loadSeasons().catch(() => null);
-        const derivedSeason = inferSeasonForTrip({
-          seasonsData, country: ready?.destination?.country, region: ready?.destination?.region,
-          startDate: ready?.startDate, endDate: ready?.endDate,
-        }) || "all";
+        body = await req.json();
+      } catch {
+        return closeWithError("Invalid JSON body");
+      }
 
-        const products = await getCsvProducts();
-        const shortlist = filterProducts(products, { activities: ready.activities || [], season: derivedSeason, maxWeight: 4000 });
+      // ---- Helpers ---------------------------------------------------------
+      const safeContext = normalizeContext(body?.context);
+      const message = (body?.message || "").trim();
+      const hasDirectPrompt = typeof body?.prompt === "string" && body.prompt.trim().length > 0;
 
-        const productContext = shortlist.slice(0, 60).map((p) => ({
-          category: p.category, name: p.name, weight_grams: p.weight_grams || undefined,
-          activities: p.activities || undefined, seasons: p.seasons || undefined, url: p.url || undefined,
-        }));
-        const userContent =
-          `Maak een paklijst.\n` +
-          `Bestemming: ${ready?.destination?.country || "-"}${ready?.destination?.region ? " - " + ready?.destination?.region : ""}\n` +
-          `Periode: ${ready?.startDate || "?"} t/m ${ready?.endDate || "?"} (${ready?.durationDays || "?"} dagen)\n` +
-          `Afgeleid seizoen: ${derivedSeason}\n` +
-          `Activiteiten: ${(ready.activities || []).join(", ") || "geen"}\n` +
-          `Voorkeuren: ${JSON.stringify(ready.preferences || {})}\n\n` +
-          `Beschikbare producten (max 60):\n` + `${JSON.stringify(productContext).slice(0, 12000)}\n`;
+      try {
+        // 1) SLOT-FILLING LOOP (alleen bij vrije tekst)
+        if (!hasDirectPrompt && message) {
+          // Probeer velden te extraheren uit de laatste user zin + huidige context
+          const extracted = await extractSlots({ utterance: message, context: safeContext });
+          mergeInto(safeContext, extracted?.context || {});
 
-        const r = await openai.chat.completions.create({
-          model: MODEL, temperature: 0.5,
-          messages: [{ role: "system", content: SYS_ADVICE }, { role: "user", content: userContent }],
-        });
-        const advice = r.choices?.[0]?.message?.content || "";
-        return withCors(req, {
-          status: 200, headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ ok: true, advice, suggestedProducts: shortlist.slice(0, 30), meta: { model: MODEL } }),
+          // Check missende slots
+          const missing = missingSlots(safeContext);
+          if (missing.length > 0) {
+            // Formuleer vervolgvraag server-side (zodat UI dumb kan blijven)
+            const followupQ = await followupQuestion({ missing, context: safeContext });
+            send("needs", { missing, contextOut: safeContext });
+            send("ask", { question: followupQ, missing });
+            send("context", await derivedContext(safeContext));
+            controller.close();
+            return;
+          }
+
+          // Alles aanwezig → ga genereren
+          await generateAndStream({
+            controller,
+            send,
+            prompt: buildPromptFromContext(safeContext),
+            context: safeContext,
+          });
+          return;
+        }
+
+        // 2) BACKWARDS COMPAT: wizard-pad
+        const prompt = hasDirectPrompt ? body.prompt.trim() : buildPromptFromContext(safeContext);
+        const missing = missingSlots(safeContext);
+        if (!hasDirectPrompt && missing.length > 0) {
+          // Wizard stuurde nog te weinig → zelfde gedrag als voorheen
+          send("needs", { missing, contextOut: safeContext });
+          send("context", await derivedContext(safeContext));
+          controller.close();
+          return;
+        }
+
+        await generateAndStream({
+          controller,
+          send,
+          prompt,
+          context: safeContext,
         });
       } catch (e) {
-        return withCors(req, { status: 500, headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ok: false, error: "OPENAI_ERROR", details: String(e?.message || e) }) });
+        closeWithError(e?.message || "Onbekende fout");
       }
-    }
+    },
+  });
 
-    // ---------- STREAM ----------
-    const stream = new ReadableStream({
-      start: async (controller) => {
-        const enc = new TextEncoder();
-        const write = (evt) => controller.enqueue(enc.encode(sseEncode(evt)));
-        const hb = setInterval(() => { try { write({ comment: "heartbeat" }); } catch {} }, 15000);
-        const close = () => { try { clearInterval(hb); } catch {} };
+  return new Response(stream, {
+    status: 200,
+    headers: {
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
+      "Access-Control-Allow-Origin": ORIGIN || "*", // pas aan indien nodig
+    },
+  });
+}
 
-        try {
-          write({ comment: "connected" });
-          const { ctx: ready2, missing: miss2 } = fillDefaultsAndFindMissing(normalizeDates(merged));
+// --------------------------- Slot-filling helpers ---------------------------
 
-          write({ event: "start", data: { model: MODEL, missing: miss2 } });
+function normalizeContext(ctx = {}) {
+  const c = typeof ctx === "object" && ctx ? structuredClone(ctx) : {};
+  c.destination = c.destination || {};
+  if (c.activities && !Array.isArray(c.activities)) {
+    // accepteer komma-gescheiden string
+    c.activities = String(c.activities)
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+  }
+  ensureKeys(c, ["durationDays", "startDate", "endDate", "month", "preferences"]);
+  ensureKeys(c.destination, ["country", "region"]);
+  return c;
+}
+function ensureKeys(o, keys) { for (const k of keys) if (!(k in o)) o[k] = null; }
 
-          if (miss2.length) {
-            write({ event: "delta", data: { text: `\n${followUpText(miss2)}\n` } });
-            write({ event: "needs", data: { missing: miss2, contextOut: ready2 } });
-            write({ event: "done", data: { ok: true } });
-            controller.close(); close(); return;
-          }
+function missingSlots(ctx) {
+  const missing = [];
+  if (!ctx?.durationDays || ctx.durationDays < 1) missing.push("durationDays");
+  if (!ctx?.destination?.country) missing.push("destination.country");
+  // Periode: óf maand óf start+end
+  if (!ctx?.month && !(ctx?.startDate && ctx?.endDate)) missing.push("period");
+  // activiteiten optioneel → laat weg
+  return missing;
+}
 
-          // seasons
-          let derivedSeason = "all";
-          try {
-            const seasonsData = await loadSeasons();
-            derivedSeason = inferSeasonForTrip({
-              seasonsData, country: ready2?.destination?.country, region: ready2?.destination?.region,
-              startDate: ready2?.startDate, endDate: ready2?.endDate,
-            }) || "all";
-          } catch { derivedSeason = "all"; }
+function buildPromptFromContext(ctx) {
+  const where = [ctx?.destination?.country, ctx?.destination?.region].filter(Boolean).join(" - ") || "?";
+  const when = ctx?.month
+    ? `in ${ctx.month}`
+    : `${ctx?.startDate || "?"} t/m ${ctx?.endDate || "?"}`;
+  const acts = Array.isArray(ctx?.activities) && ctx.activities.length ? ` Activiteiten: ${ctx.activities.join(", ")}.` : "";
+  const days = ctx?.durationDays || "?";
+  return `Maak een backpack paklijst voor ${days} dagen naar ${where}, ${when}.${acts}`;
+}
 
-          // producten
-          let shortlist = [];
-          try {
-            const products = await getCsvProducts();
-            shortlist = filterProducts(products, { activities: ready2.activities || [], season: derivedSeason, maxWeight: 4000 });
-          } catch (e) {
-            write({ event: "error", data: { message: "CSV_ERROR", details: String(e?.message || e) } });
-            controller.close(); close(); return;
-          }
-
-          const productContext = shortlist.slice(0, 60).map((p) => ({
-            category: p.category, name: p.name, weight_grams: p.weight_grams || undefined,
-            activities: p.activities || undefined, seasons: p.seasons || undefined, url: p.url || undefined,
-          }));
-          const userContent =
-            `Maak een paklijst.\n` +
-            `Bestemming: ${ready2?.destination?.country || "-"}${ready2?.destination?.region ? " - " + ready2?.destination?.region : ""}\n` +
-            `Periode: ${ready2?.startDate || "?"} t/m ${ready2?.endDate || "?"} (${ready2?.durationDays || "?"} dagen)\n` +
-            `Afgeleid seizoen: ${derivedSeason}\n` +
-            `Activiteiten: ${(ready2.activities || []).join(", ") || "geen"}\n` +
-            `Voorkeuren: ${JSON.stringify(ready2.preferences || {})}\n\n` +
-            `Beschikbare producten (max 60):\n` + `${JSON.stringify(productContext).slice(0, 12000)}\n`;
-
-          write({ event: "context", data: { products: productContext.slice(0, 20), season: derivedSeason } });
-
-          let OpenAI; ({ default: OpenAI } = await import("openai"));
-          const openai2 = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-          const resp = await openai2.chat.completions.create({
-            model: MODEL, temperature: 0.5, stream: true,
-            messages: [{ role: "system", content: SYS_ADVICE }, { role: "user", content: userContent }],
-          });
-
-          for await (const part of resp) {
-            const delta = part.choices?.[0]?.delta?.content;
-            if (delta) write({ event: "delta", data: delta });
-          }
-
-          write({ event: "products", data: shortlist.slice(0, 30) });
-          write({ event: "done", data: { ok: true } });
-          controller.close(); close();
-        } catch (e) {
-          try { controller.enqueue(new TextEncoder().encode(sseEncode({ event: "error", data: { message: String(e?.message || e) } }))); }
-          finally { controller.close(); }
-        }
+async function extractSlots({ utterance, context }) {
+  // JSON-only extractie, model mag GEEN vrije tekst teruggeven
+  const schema = {
+    type: "object",
+    properties: {
+      context: {
+        type: "object",
+        properties: {
+          durationDays: { type: ["integer", "null"] },
+          destination: {
+            type: "object",
+            properties: {
+              country: { type: ["string", "null"] },
+              region: { type: ["string", "null"] },
+            },
+            required: ["country", "region"],
+          },
+          startDate: { type: ["string", "null"] },
+          endDate: { type: ["string", "null"] },
+          month: { type: ["string", "null"] },
+          activities: {
+            type: "array",
+            items: { type: "string" },
+          },
+          preferences: {},
+        },
+        required: ["durationDays", "destination", "startDate", "endDate", "month", "activities", "preferences"],
       },
-    });
+    },
+    required: ["context"],
+    additionalProperties: false,
+  };
 
-    return new Response(stream, { status: 200, headers: sseHeaders(req) });
+  const sys = [
+    "Je bent een NLU-extractor. Geef ALLEEN JSON dat dit schema volgt.",
+    "Zet maanden om naar kleine letters Nederlands (januari..december).",
+    "durationDays is geheel aantal dagen indien gezegd (\"2w\" = 14).",
+    "Haal landen/regio's uit de tekst. Activities als lijst, zonder duplicaten.",
+    "Als iets niet genoemd is, zet het veld op null (niet raden).",
+  ].join(" ");
+
+  const user = [
+    `Huidige context (JSON): ${JSON.stringify(context)}`,
+    `Nieuwe zin van gebruiker: "${utterance}"`,
+    "Update de context velden met wat expliciet gezegd is. Plaats niets dat niet genoemd is.",
+  ].join("\n");
+
+  const json = await chatJSON(sys, user, schema);
+  return json;
+}
+
+function mergeInto(target, src) {
+  if (!src || typeof src !== "object") return;
+  for (const k of Object.keys(src)) {
+    const v = src[k];
+    if (v && typeof v === "object" && !Array.isArray(v)) {
+      if (!target[k] || typeof target[k] !== "object") target[k] = {};
+      mergeInto(target[k], v);
+    } else if (v !== undefined && v !== null) {
+      target[k] = v;
+    }
+  }
+}
+
+async function followupQuestion({ missing, context }) {
+  const sys =
+    "Je stelt één korte vervolgvraag in het Nederlands om ontbrekende info te verzamelen. Geen extra uitleg, alleen de vraag.";
+  const user = `Ontbrekend: ${missing.join(
+    ", "
+  )}. Voorbeeld mapping: destination.country = "naar welk land ga je (regio optioneel)"; period = "ga je in een specifieke maand of op data?"; durationDays = "hoeveel dagen?". Context: ${JSON.stringify(
+    context
+  )}`;
+  const out = await chatText(sys, user);
+  return (out || "Welke info mis ik nog?").trim();
+}
+
+async function derivedContext(ctx) {
+  const sys =
+    "Bepaal, indien mogelijk, het seizoen (winter/lente/zomer/herfst of tropisch nat/droog) op basis van land/maand of data. Kort antwoord, alleen het veld 'season'. Geef JSON.";
+  const user = `Context: ${JSON.stringify(ctx)}.`;
+  const schema = {
+    type: "object",
+    properties: { season: { type: ["string", "null"] } },
+    required: ["season"],
+  };
+  const json = await chatJSON(sys, user, schema);
+  return json;
+}
+
+// --------------------------- Generation & streaming -------------------------
+
+async function generateAndStream({ controller, send, prompt, context }) {
+  // Stuur context terug (bijv. season hint)
+  send("context", await derivedContext(context));
+
+  // Start streaming van de hoofdtekst
+  send("start", {});
+  try {
+    await streamOpenAI({
+      prompt,
+      onDelta: (chunk) => send("delta", chunk),
+    });
+  } catch (e) {
+    send("error", { message: e?.message || "Fout bij genereren" });
+    controller.close();
+    return;
   }
 
-  /* ---------- Legacy pad (activities/duration/season) ---------- */
-  const { activities = [], durationDays = 7, season = "all", preferences = {} } = body;
+  // Product-suggesties
   try {
-    const products = await getCsvProducts();
-    const shortlist = filterProducts(products, { activities, season, maxWeight: 4000 });
+    const products = await suggestProducts(context);
+    if (Array.isArray(products) && products.length) send("products", products.slice(0, 24));
+  } catch {
+    // stil falen is oké voor products
+  }
 
-    if (!process.env.OPENAI_API_KEY)
-      return withCors(req, { status: 500, body: JSON.stringify({ ok: false, error: "OPENAI_API_KEY ontbreekt in env." }) });
+  send("done", {});
+  controller.close();
+}
 
-    let OpenAI; ({ default: OpenAI } = await import("openai"));
-    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+async function suggestProducts(ctx) {
+  const sys =
+    "Je bent een gear advisor. Geef 6-12 korte product-suggesties (geen affiliatelinks) als JSON array met {category,name,weight_grams,activities,seasons,url}. Vul onbekend niet in of laat weg. Korte, generieke namen zijn oké.";
+  const user = `Context: ${JSON.stringify(ctx)}. Doel: backpack paklijst.`;
+  const schema = {
+    type: "array",
+    items: {
+      type: "object",
+      properties: {
+        category: { type: "string" },
+        name: { type: "string" },
+        weight_grams: { type: "number" },
+        activities: { type: "string" },
+        seasons: { type: "string" },
+        url: { type: "string" },
+        image: { type: "string" },
+      },
+      additionalProperties: false,
+    },
+  };
+  const arr = await chatJSON(sys, user, schema);
+  return Array.isArray(arr) ? arr : [];
+}
 
-    const productContext = shortlist.slice(0, 60).map((p) => ({
-      category: p.category, name: p.name, weight_grams: p.weight_grams || undefined,
-      activities: p.activities || undefined, seasons: p.seasons || undefined, url: p.url || undefined,
-    }));
-    const userContent =
-      `Maak een paklijst.\nDuur: ${durationDays} dagen\nActiviteiten: ${activities.join(", ") || "geen"}\nSeizoen: ${season}\nVoorkeuren: ${JSON.stringify(preferences)}\n\nBeschikbare producten (max 60):\n${JSON.stringify(productContext).slice(0, 12000)}\n`;
+// --------------------------- OpenAI wrappers --------------------------------
 
-    if (wantStream) {
-      const stream = new ReadableStream({
-        start: async (controller) => {
-          const write = (evt) => controller.enqueue(new TextEncoder().encode(sseEncode(evt)));
-          const hb = setInterval(() => { try { write({ comment: "heartbeat" }); } catch {} }, 15000);
-          const close = () => { try { clearInterval(hb); } catch {} };
-          try {
-            write({ event: "start", data: { activities, durationDays, season, model: MODEL } });
-            write({ event: "context", data: { products: productContext.slice(0, 20) } });
-            const resp = await openai.chat.completions.create({
-              model: MODEL, temperature: 0.5, stream: true,
-              messages: [{ role: "system", content: SYS_ADVICE }, { role: "user", content: userContent }],
-            });
-            for await (const part of resp) {
-              const delta = part.choices?.[0]?.delta?.content;
-              if (delta) write({ event: "delta", data: delta });
-            }
-            write({ event: "products", data: shortlist.slice(0, 30) });
-            write({ event: "done", data: { ok: true } });
-            controller.close(); close();
-          } catch (e) {
-            write({ event: "error", data: { message: String(e?.message || e) } });
-            controller.close(); close();
-          }
+async function chatText(system, user) {
+  const res = await fetch(`${OPENAI_API_BASE}/chat/completions`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: OPENAI_MODEL_TEXT,
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: user },
+      ],
+      temperature: 0.2,
+    }),
+  });
+  if (!res.ok) throw new Error(`OpenAI text error: ${res.status}`);
+  const json = await res.json();
+  return json?.choices?.[0]?.message?.content || "";
+}
+
+async function chatJSON(system, user, jsonSchema) {
+  const res = await fetch(`${OPENAI_API_BASE}/chat/completions`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: OPENAI_MODEL_JSON,
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: user },
+      ],
+      temperature: 0,
+      response_format: {
+        type: "json_schema",
+        json_schema: {
+          name: "extraction",
+          schema: jsonSchema,
+          strict: true,
         },
-      });
-      return new Response(stream, { status: 200, headers: sseHeaders(req) });
-    } else {
-      const r = await openai.chat.completions.create({
-        model: MODEL, temperature: 0.5,
-        messages: [{ role: "system", content: SYS_ADVICE }, { role: "user", content: userContent }],
-      });
-      const advice = r.choices?.[0]?.message?.content || "";
-      return withCors(req, {
-        status: 200, headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ok: true, advice, suggestedProducts: shortlist.slice(0, 30), meta: { model: MODEL } }),
-      });
+      },
+    }),
+  });
+  if (!res.ok) throw new Error(`OpenAI json error: ${res.status}`);
+  const json = await res.json();
+  const txt = json?.choices?.[0]?.message?.content || "{}";
+  try {
+    return JSON.parse(txt);
+  } catch {
+    return {};
+  }
+}
+
+async function streamOpenAI({ prompt, onDelta }) {
+  // Streaming text als platte delta-chunks
+  const res = await fetch(`${OPENAI_API_BASE}/chat/completions`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: OPENAI_MODEL_TEXT,
+      stream: true,
+      temperature: 0.4,
+      messages: [
+        {
+          role: "system",
+          content:
+            "Je schrijft compacte, praktische paklijsten in het Nederlands. Gebruik duidelijke secties: Korte samenvatting, Kleding, Gear, Gadgets, Health, Tips. Geen overbodige disclaimers.",
+        },
+        { role: "user", content: prompt },
+      ],
+    }),
+  });
+  if (!res.ok || !res.body) throw new Error(`OpenAI stream error: ${res.status}`);
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    // OpenAI streams met "data: ..." lijnen (SSE)
+    const parts = buffer.split("\n\n");
+    for (let i = 0; i < parts.length - 1; i++) {
+      const block = parts[i];
+      const line = block.split("\n").find((l) => l.startsWith("data: "));
+      if (!line) continue;
+      const data = line.slice(6).trim();
+      if (data === "[DONE]") return;
+      try {
+        const json = JSON.parse(data);
+        const delta = json?.choices?.[0]?.delta?.content;
+        if (delta) onDelta(delta);
+      } catch {
+        // negeren
+      }
     }
-  } catch (e) {
-    return withCors(req, { status: 500, headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ok: false, error: "SERVER_ERROR", details: String(e?.message || e) }) });
+    buffer = parts[parts.length - 1];
   }
 }
