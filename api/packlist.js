@@ -3,11 +3,11 @@ export const runtime = "edge";
 
 /**
  * Packlist SSE + Slot-Filling Chat Backend (Edge)
- * - CORS/OPTIONS fix
- * - Deterministische vervolgvragen op missende velden
- * - Extra context-event
- * - OpenAI JSON/text helpers (zoals jouw oude API)
- * - Producten uit CSV (public/pack_products.csv) met caching
+ * - CORS/OPTIONS fix (zelfde gedrag als je oude file)
+ * - Hybride slot-extractie (regex + optionele LLM-verrijking)
+ * - needs.contextOut stuurt ALLEEN de delta (voorkomt null-overwrites in frontend)
+ * - CSV-producten uit /public/pack_products.csv of via env PRODUCTS_CSV_URL (GitHub raw etc.)
+ * - Productfilter op activities + (grof) seizoen/maand + graceful fallback
  */
 
 const OPENAI_API_BASE = "https://api.openai.com/v1";
@@ -104,13 +104,14 @@ export async function POST(req) {
         // Vrije-tekst modus (slot-filling)
         if (!hasDirectPrompt && message) {
           const extracted = await extractSlots({ utterance: message, context: safeContext });
+          // merge de delta in onze server-side context om 'missing' te kunnen bepalen
           mergeInto(safeContext, extracted?.context || {});
           const missing = missingSlots(safeContext);
 
           if (missing.length > 0) {
             const followupQ = followupQuestion({ missing, context: safeContext });
-            // Stuur naar frontend zodat jouw Framer-component het 'geheugen' bijwerkt
-            send("needs", { missing, contextOut: safeContext });
+            // ⬇️ Stuur ALLEEN de delta terug naar de frontend (voorkomt null-overwrites)
+            send("needs", { missing, contextOut: extracted?.context || {} });
             send("ask", { question: followupQ, missing });
             send("context", await derivedContext(safeContext));
             controller.close();
@@ -132,7 +133,8 @@ export async function POST(req) {
         const missing = missingSlots(safeContext);
         if (!hasDirectPrompt && missing.length > 0) {
           const followupQ = followupQuestion({ missing, context: safeContext });
-          send("needs", { missing, contextOut: safeContext });
+          // hier geen extra delta; user leverde nog niets nieuws
+          send("needs", { missing, contextOut: {} });
           send("ask", { question: followupQ, missing });
           send("context", await derivedContext(safeContext));
           controller.close();
@@ -194,53 +196,87 @@ function buildPromptFromContext(ctx) {
   return `Maak een backpack paklijst voor ${days} dagen naar ${where}, ${when}.${acts}`;
 }
 
-/* -------------------- Extraction helpers -------------------- */
+/* -------------------- Hybride slot-extractie -------------------- */
 
 async function extractSlots({ utterance, context }) {
-  const schema = {
-    type: "object",
-    properties: {
-      context: {
-        type: "object",
-        properties: {
-          durationDays: { type: ["integer", "null"] },
-          destination: {
-            type: "object",
-            properties: {
-              country: { type: ["string", "null"] },
-              region: { type: ["string", "null"] },
-            },
-            required: ["country", "region"],
-          },
-          startDate: { type: ["string", "null"] },
-          endDate: { type: ["string", "null"] },
-          month: { type: ["string", "null"] },
-          activities: { type: "array", items: { type: "string" } },
-          preferences: {},
-        },
-        required: ["durationDays", "destination", "startDate", "endDate", "month", "activities", "preferences"],
-      },
+  // 1) deterministische baseline (regex) — dekt "Vietnam", "juli", "30 dagen", "duiken/hiken" etc.
+  const m = (utterance || "").toLowerCase().normalize("NFKD").replace(/[\u0300-\u036f]/g, "");
+  const baseline = {
+    context: {
+      durationDays: null,
+      destination: { country: null, region: null },
+      startDate: null,
+      endDate: null,
+      month: null,
+      activities: [],
+      preferences: null,
     },
-    required: ["context"],
-    additionalProperties: false,
   };
 
-  const sys = [
-    "Je bent een NLU-extractor. Geef ALLEEN JSON dat het schema volgt.",
-    "Zet maanden om naar kleine letters Nederlands (januari..december).",
-    "durationDays is geheel aantal dagen (\"2w\" = 14).",
-    "Haal landen/regio's uit de tekst. Activities als lijst, zonder duplicaten.",
-    "Als iets niet genoemd is, zet het veld op null (niet raden).",
-  ].join(" ");
+  // Landen (breid uit naar wens)
+  const COUNTRY = [
+    { re: /\bvietnam\b/,                 name: "Vietnam" },
+    { re: /\bindonesie|indonesia\b/,     name: "Indonesië" },
+    { re: /\bthailand\b/,                name: "Thailand" },
+    { re: /\bmaleisie|malaysia\b/,       name: "Maleisië" },
+    { re: /\bfilipijnen|philippines\b/,  name: "Filipijnen" },
+    { re: /\blaos\b/,                    name: "Laos" },
+    { re: /\bcambodja|cambodia\b/,       name: "Cambodja" },
+  ];
+  const hit = COUNTRY.find(c => c.re.test(m));
+  if (hit) baseline.context.destination.country = hit.name;
 
-  const user = [
-    `Huidige context (JSON): ${JSON.stringify(context)}`,
-    `Nieuwe zin van gebruiker: "${utterance}"`,
-    "Update de context velden met wat expliciet gezegd is. Plaats niets dat niet genoemd is.",
-  ].join("\n");
+  // Maand
+  const MONTH = /(januari|februari|maart|april|mei|juni|juli|augustus|september|oktober|november|december)/;
+  const mm = m.match(MONTH);
+  if (mm) baseline.context.month = mm[1];
 
-  const json = await chatJSON(sys, user, schema);
-  return json;
+  // Duur
+  const dDays = m.match(/(\d{1,3})\s*(dagen|dag|dgn|d)\b/);
+  const dWks  = m.match(/(\d{1,2})\s*(weken|wk|w)\b/);
+  if (dDays) baseline.context.durationDays = Number(dDays[1]);
+  else if (dWks) baseline.context.durationDays = Number(dWks[1]) * 7;
+
+  // Datumbereik (optioneel)
+  const dateRange = m.match(/(\d{1,2})[-/.](\d{1,2})[-/.](\d{2,4}).{0,30}?(\d{1,2})[-/.](\d{1,2})[-/.](\d{2,4})/);
+  if (dateRange) {
+    const [, d1, mo1, y1, d2, mo2, y2] = dateRange;
+    baseline.context.startDate = toISO(y1, mo1, d1);
+    baseline.context.endDate   = toISO(y2, mo2, d2);
+  }
+
+  // Activiteiten
+  const acts = [];
+  if (/(duik|duiken|snorkel|scuba)/.test(m)) acts.push("duiken");
+  if (/(hike|hiken|trek|wandelen)/.test(m)) acts.push("hiken");
+  if (/(surf|surfen)/.test(m)) acts.push("surfen");
+  if (/(city|stad|citytrip)/.test(m)) acts.push("citytrip");
+  if (acts.length) baseline.context.activities = acts;
+
+  // 2) Optionele LLM-verrijking (zacht falen)
+  if (process.env.OPENAI_API_KEY) {
+    try {
+      const schema = {
+        type: "object",
+        properties: { context: { type: "object" } },
+        required: ["context"],
+        additionalProperties: true,
+      };
+      const sys = "Verrijk onderstaande context met expliciet genoemde feiten. Geef ALLEEN JSON.";
+      const user = `Huidige context: ${JSON.stringify(context)}\nZin: "${utterance}"\nVoeg genoemde velden toe; onbekend blijft null.`;
+      const llm = await chatJSON(sys, user, schema);
+      mergeInto(baseline, llm);
+    } catch {}
+  }
+
+  return baseline;
+}
+
+function toISO(y, m, d) {
+  const year = (+y < 100 ? 2000 + (+y) : +y);
+  const month = String(+m).padStart(2, "0");
+  const day = String(+d).padStart(2, "0");
+  return `${year}-${month}-${day}`;
 }
 
 function mergeInto(target, src) {
@@ -305,17 +341,14 @@ async function generateAndStream({ controller, send, req, prompt, context }) {
   try {
     const products = await productsFromCSV(context, req);
     if (Array.isArray(products) && products.length) {
-      // stuur in 2 batches voor snappier UI
+      // batch voor snellere UI
       const batch = 6;
       for (let i = 0; i < Math.min(products.length, 24); i += batch) {
         send("products", products.slice(i, i + batch));
       }
     }
-  } catch (e) {
-    // zachte fout; geen crash
-  }
+  } catch {}
 
-  // stuur context nogmaals
   send("context", { ...derived });
   send("done", {});
   controller.close();
@@ -323,15 +356,16 @@ async function generateAndStream({ controller, send, req, prompt, context }) {
 
 /* -------------------- CSV producten -------------------- */
 /**
- * Verwacht CSV in /public/pack_products.csv met headers:
+ * CSV in /public/pack_products.csv (aanrader) OF env PRODUCTS_CSV_URL (absolute URL)
+ * Headers verwacht:
  * category,name,weight_grams,activities,seasons,url,image
- * - activities: bv. "hiken,duiken"  (case-insensitive match)
- * - seasons:    bv. "zomer,regenseizoen,alle"
+ * - activities: bv. "hiken,duiken"
+ * - seasons:    bv. "zomer,winter,alle" of maandnamen
  */
 
 const CSV_PUBLIC_PATH = "/pack_products.csv";
+const CSV_REMOTE_URL  = process.env.PRODUCTS_CSV_URL || "";
 
-// Globale cache (Edge runtime: per region/process)
 function getCsvCache() {
   if (!globalThis.__PACKLIST_CSV__) {
     globalThis.__PACKLIST_CSV__ = { rows: null, at: 0 };
@@ -343,22 +377,17 @@ async function productsFromCSV(ctx, req) {
   const origin = new URL(req.url).origin;
   const rows = await loadCsvOnce(origin);
 
-  // Normaliseer filters
   const acts = (ctx?.activities || []).map((s) => String(s).toLowerCase());
   const month = (ctx?.month || "").toLowerCase();
 
-  // Grof seizoenslabel op basis van maand
   let seasonHint = "";
   if (["december", "januari", "februari"].includes(month)) seasonHint = "winter";
   else if (["juni", "juli", "augustus"].includes(month)) seasonHint = "zomer";
 
-  // Filteren:
   const filtered = rows.filter((r) => {
-    // activities: product zonder activities = general; anders: intersect
     const prodActs = splitCsvList(r.activities);
     const actsOk = prodActs.length === 0 || acts.some((a) => prodActs.includes(a));
 
-    // seasons: leeg = all; anders: match op maand/seizoenshint/"alle"
     const prodSeasons = splitCsvList(r.seasons);
     const seasonOk =
       prodSeasons.length === 0 ||
@@ -369,8 +398,17 @@ async function productsFromCSV(ctx, req) {
     return actsOk && seasonOk;
   });
 
-  // Map naar verwachte shape + limit
-  return dedupeBy(filtered.map(mapCsvRow), (p) => `${p.category}|${p.name}`).slice(0, 24);
+  // Graceful fallback: algemene items (als filter te streng is)
+  let out = filtered;
+  if (out.length === 0) {
+    out = rows.filter((r) => {
+      const a = splitCsvList(r.activities).length === 0;
+      const s = splitCsvList(r.seasons);
+      return a && (s.length === 0 || s.includes("alle"));
+    });
+  }
+
+  return dedupeBy(out.map(mapCsvRow), (p) => `${p.category}|${p.name}`).slice(0, 24);
 }
 
 function splitCsvList(v) {
@@ -398,10 +436,7 @@ function dedupeBy(arr, keyFn) {
   const out = [];
   for (const x of arr) {
     const k = keyFn(x);
-    if (!seen.has(k)) {
-      seen.add(k);
-      out.push(x);
-    }
+    if (!seen.has(k)) { seen.add(k); out.push(x); }
   }
   return out;
 }
@@ -411,8 +446,8 @@ async function loadCsvOnce(origin) {
   if (cache.rows && Date.now() - cache.at < 1000 * 60 * 10) {
     return cache.rows; // 10 min cache
   }
-  const url = new URL(CSV_PUBLIC_PATH, origin).toString();
-  const res = await fetch(url, { cache: "force-cache" });
+  const url = CSV_REMOTE_URL || new URL(CSV_PUBLIC_PATH, origin).toString();
+  const res = await fetch(url, { cache: "no-store" });
   if (!res.ok) throw new Error(`CSV fetch failed (${res.status})`);
   const text = await res.text();
   const rows = parseCsv(text);
@@ -430,14 +465,12 @@ function parseCsv(text) {
     const cells = splitCsvLine(lines[i]);
     const row = {};
     headers.forEach((h, idx) => (row[h] = cells[idx] ?? ""));
-    // normalisatie veelvoorkomende kolomnamen
     if ("weight" in row && !("weight_grams" in row)) row.weight_grams = row.weight;
     out.push(row);
   }
   return out;
 }
 
-// CSV regel-splitter met quotes ondersteuning
 function splitCsvLine(line) {
   const out = [];
   let cur = "";
@@ -445,22 +478,13 @@ function splitCsvLine(line) {
   for (let i = 0; i < line.length; i++) {
     const ch = line[i];
     if (inQ) {
-      if (ch === '"' && line[i + 1] === '"') {
-        cur += '"'; i++; // escaped quote
-      } else if (ch === '"') {
-        inQ = false;
-      } else {
-        cur += ch;
-      }
+      if (ch === '"' && line[i + 1] === '"') { cur += '"'; i++; }
+      else if (ch === '"') { inQ = false; }
+      else { cur += ch; }
     } else {
-      if (ch === '"') {
-        inQ = true;
-      } else if (ch === ",") {
-        out.push(cur);
-        cur = "";
-      } else {
-        cur += ch;
-      }
+      if (ch === '"') { inQ = true; }
+      else if (ch === ",") { out.push(cur); cur = ""; }
+      else { cur += ch; }
     }
   }
   out.push(cur);
