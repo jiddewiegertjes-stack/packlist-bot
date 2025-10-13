@@ -3,10 +3,10 @@ export const runtime = "edge";
 
 /**
  * Packlist SSE + Slot-Filling Chat Backend (Edge)
- * - CORS/OPTIONS fix
+ * - CORS/OPTIONS
  * - Hybride slot-extractie (regex + optionele LLM-verrijking)
- * - needs.contextOut stuurt ALLEEN de delta
- * - CSV-producten uit /public/pack_products.csv of env PRODUCTS_CSV_URL
+ * - needs.contextOut stuurt ALLEEN de delta (frontend deep-merge)
+ * - CSV-producten uit /public/pack_products.csv of env PRODUCTS_CSV_URL (Google Sheets Raw/Export)
  * - Debugregel voor CSV/filters + batching + graceful fallback
  */
 
@@ -101,16 +101,15 @@ export async function POST(req) {
         typeof body?.prompt === "string" && body.prompt.trim().length > 0;
 
       try {
-        // Vrije-tekst modus (slot-filling)
+        // Vrije-tekst (slot-filling)
         if (!hasDirectPrompt && message) {
           const extracted = await extractSlots({ utterance: message, context: safeContext });
-          // merge delta in servercontext om 'missing' te bepalen
-          mergeInto(safeContext, extracted?.context || {});
+          mergeInto(safeContext, extracted?.context || {}); // server-side context bijwerken
           const missing = missingSlots(safeContext);
 
           if (missing.length > 0) {
             const followupQ = followupQuestion({ missing, context: safeContext });
-            // ⬇️ alleen de delta terug (voorkomt null-overwrites in frontend)
+            // ⬇️ stuur ALLEEN de delta terug (frontend deep-merge beschermt bestaande waarden)
             send("needs", { missing, contextOut: extracted?.context || {} });
             send("ask", { question: followupQ, missing });
             send("context", await derivedContext(safeContext));
@@ -297,7 +296,7 @@ function followupQuestion({ missing, context }) {
   if (context?.destination?.country) pref.push(`bestemming: ${context.destination.country}`);
   if (context?.durationDays) pref.push(`duur: ${context.durationDays} dagen`);
   if (context?.month) pref.push(`maand: ${context.month}`);
-  if (context?.startDate && context?.endDate) pref.push(`data: ${context.startDate} t/m ${context.endDate}`);
+  if (context?.startDate && ctx?.endDate) pref.push(`data: ${context.startDate} t/m ${context.endDate}`);
   const hint = pref.length ? ` (bekend: ${pref.join(", ")})` : "";
   return `Kun je nog aangeven: ${labels.join(", ")}?${hint}`;
 }
@@ -359,12 +358,17 @@ async function generateAndStream({ controller, send, req, prompt, context }) {
 
 /* -------------------- CSV producten -------------------- */
 /**
- * CSV in /public/pack_products.csv OF env PRODUCTS_CSV_URL (absolute URL)
+ * CSV in /public/pack_products.csv OF env PRODUCTS_CSV_URL (absolute URL, bv. Google Sheets export)
  * Headers: category,name,weight_grams,activities,seasons,url,image
  */
 
-const CSV_PUBLIC_PATH = "/pack_products.csv";
-const CSV_REMOTE_URL  = process.env.PRODUCTS_CSV_URL || "";
+const CSV_PUBLIC_PATH = "/pack_products.csv"; // fallback-pad
+
+// Runtime ENV-resolver (niet op top-level cachen!)
+function resolveCsvUrl(origin) {
+  const url = (process.env.PRODUCTS_CSV_URL && String(process.env.PRODUCTS_CSV_URL).trim()) || "";
+  return url || new URL(CSV_PUBLIC_PATH, origin).toString();
+}
 
 function getCsvCache() {
   if (!globalThis.__PACKLIST_CSV__) {
@@ -375,9 +379,7 @@ function getCsvCache() {
 
 async function productsFromCSV(ctx, req) {
   const origin = new URL(req.url).origin;
-  const resolvedUrl = (CSV_REMOTE_URL && String(CSV_REMOTE_URL).trim())
-    ? String(CSV_REMOTE_URL).trim()
-    : new URL(CSV_PUBLIC_PATH, origin).toString();
+  const resolvedUrl = resolveCsvUrl(origin);
 
   // laad CSV (met fout als debugproduct)
   let rows;
@@ -457,7 +459,7 @@ function mapCsvRow(r) {
   return {
     category: r.category || "",
     name: r.name || "",
-    weight_grams: r.weight_grams ? Number(r.weight_grams) : null,
+    weight_grams: r.weight_grams ? Number(String(r.weight_grams).replace(",", ".")) : null,
     activities: r.activities || "",
     seasons: r.seasons || "",
     url: r.url || "",
@@ -481,10 +483,7 @@ async function loadCsvOnce(origin) {
     return cache.rows; // 10 min cache
   }
 
-  const url = (CSV_REMOTE_URL && String(CSV_REMOTE_URL).trim())
-    ? String(CSV_REMOTE_URL).trim()
-    : new URL(CSV_PUBLIC_PATH, origin).toString();
-
+  const url = resolveCsvUrl(origin);
   const res = await fetch(url, { cache: "no-store" });
   if (!res.ok) throw new Error(`CSV fetch failed ${res.status} @ ${url}`);
 
