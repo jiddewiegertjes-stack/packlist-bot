@@ -3,11 +3,11 @@ export const runtime = "edge";
 
 /**
  * Packlist SSE + Slot-Filling Chat Backend (Edge)
- * - CORS/OPTIONS fix (zelfde gedrag als je oude file)
+ * - CORS/OPTIONS fix
  * - Hybride slot-extractie (regex + optionele LLM-verrijking)
- * - needs.contextOut stuurt ALLEEN de delta (voorkomt null-overwrites in frontend)
- * - CSV-producten uit /public/pack_products.csv of via env PRODUCTS_CSV_URL (GitHub raw etc.)
- * - Productfilter op activities + (grof) seizoen/maand + graceful fallback
+ * - needs.contextOut stuurt ALLEEN de delta
+ * - CSV-producten uit /public/pack_products.csv of env PRODUCTS_CSV_URL
+ * - Debugregel voor CSV/filters + batching + graceful fallback
  */
 
 const OPENAI_API_BASE = "https://api.openai.com/v1";
@@ -104,13 +104,13 @@ export async function POST(req) {
         // Vrije-tekst modus (slot-filling)
         if (!hasDirectPrompt && message) {
           const extracted = await extractSlots({ utterance: message, context: safeContext });
-          // merge de delta in onze server-side context om 'missing' te kunnen bepalen
+          // merge delta in servercontext om 'missing' te bepalen
           mergeInto(safeContext, extracted?.context || {});
           const missing = missingSlots(safeContext);
 
           if (missing.length > 0) {
             const followupQ = followupQuestion({ missing, context: safeContext });
-            // ⬇️ Stuur ALLEEN de delta terug naar de frontend (voorkomt null-overwrites)
+            // ⬇️ alleen de delta terug (voorkomt null-overwrites in frontend)
             send("needs", { missing, contextOut: extracted?.context || {} });
             send("ask", { question: followupQ, missing });
             send("context", await derivedContext(safeContext));
@@ -133,7 +133,6 @@ export async function POST(req) {
         const missing = missingSlots(safeContext);
         if (!hasDirectPrompt && missing.length > 0) {
           const followupQ = followupQuestion({ missing, context: safeContext });
-          // hier geen extra delta; user leverde nog niets nieuws
           send("needs", { missing, contextOut: {} });
           send("ask", { question: followupQ, missing });
           send("context", await derivedContext(safeContext));
@@ -199,7 +198,7 @@ function buildPromptFromContext(ctx) {
 /* -------------------- Hybride slot-extractie -------------------- */
 
 async function extractSlots({ utterance, context }) {
-  // 1) deterministische baseline (regex) — dekt "Vietnam", "juli", "30 dagen", "duiken/hiken" etc.
+  // 1) Regex baseline (werkt zonder API-key)
   const m = (utterance || "").toLowerCase().normalize("NFKD").replace(/[\u0300-\u036f]/g, "");
   const baseline = {
     context: {
@@ -213,7 +212,7 @@ async function extractSlots({ utterance, context }) {
     },
   };
 
-  // Landen (breid uit naar wens)
+  // Landen
   const COUNTRY = [
     { re: /\bvietnam\b/,                 name: "Vietnam" },
     { re: /\bindonesie|indonesia\b/,     name: "Indonesië" },
@@ -253,15 +252,10 @@ async function extractSlots({ utterance, context }) {
   if (/(city|stad|citytrip)/.test(m)) acts.push("citytrip");
   if (acts.length) baseline.context.activities = acts;
 
-  // 2) Optionele LLM-verrijking (zacht falen)
+  // 2) Optioneel: LLM-verrijking
   if (process.env.OPENAI_API_KEY) {
     try {
-      const schema = {
-        type: "object",
-        properties: { context: { type: "object" } },
-        required: ["context"],
-        additionalProperties: true,
-      };
+      const schema = { type: "object", properties: { context: { type: "object" } }, required: ["context"], additionalProperties: true };
       const sys = "Verrijk onderstaande context met expliciet genoemde feiten. Geef ALLEEN JSON.";
       const user = `Huidige context: ${JSON.stringify(context)}\nZin: "${utterance}"\nVoeg genoemde velden toe; onbekend blijft null.`;
       const llm = await chatJSON(sys, user, schema);
@@ -299,7 +293,6 @@ function followupQuestion({ missing, context }) {
   if (missing.includes("destination.country")) labels.push("bestemming (land, optioneel regio)");
   if (missing.includes("durationDays")) labels.push("hoeveel dagen");
   if (missing.includes("period")) labels.push("in welke periode (maand of exacte data)");
-  // hint met al bekende context
   const pref = [];
   if (context?.destination?.country) pref.push(`bestemming: ${context.destination.country}`);
   if (context?.durationDays) pref.push(`duur: ${context.durationDays} dagen`);
@@ -341,13 +334,23 @@ async function generateAndStream({ controller, send, req, prompt, context }) {
   try {
     const products = await productsFromCSV(context, req);
     if (Array.isArray(products) && products.length) {
-      // batch voor snellere UI
       const batch = 6;
       for (let i = 0; i < Math.min(products.length, 24); i += batch) {
         send("products", products.slice(i, i + batch));
       }
     }
-  } catch {}
+  } catch (e) {
+    // Laat de reden zien in UI:
+    send("products", [{
+      category: "DEBUG",
+      name: `products error: ${(e && e.message) || "unknown"}`,
+      weight_grams: null,
+      activities: "",
+      seasons: "",
+      url: "",
+      image: ""
+    }]);
+  }
 
   send("context", { ...derived });
   send("done", {});
@@ -356,11 +359,8 @@ async function generateAndStream({ controller, send, req, prompt, context }) {
 
 /* -------------------- CSV producten -------------------- */
 /**
- * CSV in /public/pack_products.csv (aanrader) OF env PRODUCTS_CSV_URL (absolute URL)
- * Headers verwacht:
- * category,name,weight_grams,activities,seasons,url,image
- * - activities: bv. "hiken,duiken"
- * - seasons:    bv. "zomer,winter,alle" of maandnamen
+ * CSV in /public/pack_products.csv OF env PRODUCTS_CSV_URL (absolute URL)
+ * Headers: category,name,weight_grams,activities,seasons,url,image
  */
 
 const CSV_PUBLIC_PATH = "/pack_products.csv";
@@ -375,20 +375,41 @@ function getCsvCache() {
 
 async function productsFromCSV(ctx, req) {
   const origin = new URL(req.url).origin;
-  const rows = await loadCsvOnce(origin);
+  const resolvedUrl = (CSV_REMOTE_URL && String(CSV_REMOTE_URL).trim())
+    ? String(CSV_REMOTE_URL).trim()
+    : new URL(CSV_PUBLIC_PATH, origin).toString();
 
-  const acts = (ctx?.activities || []).map((s) => String(s).toLowerCase());
+  // laad CSV (met fout als debugproduct)
+  let rows;
+  try {
+    rows = await loadCsvOnce(origin);
+  } catch (e) {
+    return [{
+      category: "DEBUG",
+      name: `CSV load error: ${(e && e.message) || "unknown"}`,
+      weight_grams: null,
+      activities: "",
+      seasons: "",
+      url: resolvedUrl,
+      image: ""
+    }];
+  }
+
+  const acts  = (ctx?.activities || []).map((s) => String(s).toLowerCase());
   const month = (ctx?.month || "").toLowerCase();
 
   let seasonHint = "";
-  if (["december", "januari", "februari"].includes(month)) seasonHint = "winter";
-  else if (["juni", "juli", "augustus"].includes(month)) seasonHint = "zomer";
+  if (["december","januari","februari"].includes(month)) seasonHint = "winter";
+  else if (["juni","juli","augustus"].includes(month))   seasonHint = "zomer";
 
   const filtered = rows.filter((r) => {
-    const prodActs = splitCsvList(r.activities);
-    const actsOk = prodActs.length === 0 || acts.some((a) => prodActs.includes(a));
-
+    const prodActs    = splitCsvList(r.activities);
     const prodSeasons = splitCsvList(r.seasons);
+
+    const actsOk =
+      prodActs.length === 0 ||                 // general item
+      acts.some((a) => prodActs.includes(a));  // overlap
+
     const seasonOk =
       prodSeasons.length === 0 ||
       prodSeasons.includes("alle") ||
@@ -398,17 +419,30 @@ async function productsFromCSV(ctx, req) {
     return actsOk && seasonOk;
   });
 
-  // Graceful fallback: algemene items (als filter te streng is)
-  let out = filtered;
-  if (out.length === 0) {
-    out = rows.filter((r) => {
+  // fallback: neem algemene items (leeg/alle) als de filter niets vindt
+  let outRows = filtered;
+  if (outRows.length === 0) {
+    outRows = rows.filter((r) => {
       const a = splitCsvList(r.activities).length === 0;
       const s = splitCsvList(r.seasons);
       return a && (s.length === 0 || s.includes("alle"));
     });
   }
 
-  return dedupeBy(out.map(mapCsvRow), (p) => `${p.category}|${p.name}`).slice(0, 24);
+  // Debugregel bovenaan zodat je meteen ziet of de bron/filters kloppen
+  const debugItem = {
+    category: "DEBUG",
+    name: `csv=${resolvedUrl} | total=${rows.length} | filtered=${filtered.length} | out=${outRows.length}`,
+    weight_grams: null,
+    activities: acts.join(","),
+    seasons: seasonHint || month || "",
+    url: resolvedUrl,
+    image: ""
+  };
+
+  const mapped = outRows.map(mapCsvRow);
+  const dedup  = dedupeBy(mapped, (p) => `${p.category}|${p.name}`).slice(0, 24);
+  return [debugItem, ...dedup];
 }
 
 function splitCsvList(v) {
@@ -446,11 +480,20 @@ async function loadCsvOnce(origin) {
   if (cache.rows && Date.now() - cache.at < 1000 * 60 * 10) {
     return cache.rows; // 10 min cache
   }
-  const url = CSV_REMOTE_URL || new URL(CSV_PUBLIC_PATH, origin).toString();
+
+  const url = (CSV_REMOTE_URL && String(CSV_REMOTE_URL).trim())
+    ? String(CSV_REMOTE_URL).trim()
+    : new URL(CSV_PUBLIC_PATH, origin).toString();
+
   const res = await fetch(url, { cache: "no-store" });
-  if (!res.ok) throw new Error(`CSV fetch failed (${res.status})`);
+  if (!res.ok) throw new Error(`CSV fetch failed ${res.status} @ ${url}`);
+
   const text = await res.text();
   const rows = parseCsv(text);
+  if (!Array.isArray(rows) || rows.length === 0) {
+    throw new Error(`CSV parsed empty @ ${url}`);
+  }
+
   cache.rows = rows;
   cache.at = Date.now();
   return rows;
@@ -491,36 +534,9 @@ function splitCsvLine(line) {
   return out.map((s) => s.trim());
 }
 
-/* -------------------- OpenAI Wrappers (met fallback) -------------------- */
-
-async function chatText(system, user) {
-  const res = await fetch(`${OPENAI_API_BASE}/chat/completions`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-    },
-    body: JSON.stringify({
-      model: OPENAI_MODEL_TEXT,
-      messages: [
-        { role: "system", content: system },
-        { role: "user", content: user },
-      ],
-      temperature: 0.2,
-    }),
-  });
-
-  if (!res.ok) {
-    const err = await safeErrorText(res);
-    throw new Error(`OpenAI text error: ${res.status}${err ? ` — ${err}` : ""}`);
-  }
-
-  const json = await res.json();
-  return json?.choices?.[0]?.message?.content || "";
-}
+/* -------------------- OpenAI helpers -------------------- */
 
 async function chatJSON(system, user, jsonSchema) {
-  // 1) Probeer json_schema
   let res = await fetch(`${OPENAI_API_BASE}/chat/completions`, {
     method: "POST",
     headers: {
@@ -534,14 +550,10 @@ async function chatJSON(system, user, jsonSchema) {
         { role: "user", content: user },
       ],
       temperature: 0,
-      response_format: {
-        type: "json_schema",
-        json_schema: { name: "extraction", schema: jsonSchema, strict: true },
-      },
+      response_format: { type: "json_schema", json_schema: { name: "extraction", schema: jsonSchema, strict: true } },
     }),
   });
 
-  // 2) Fallback naar json_object bij 400
   if (!res.ok && res.status === 400) {
     res = await fetch(`${OPENAI_API_BASE}/chat/completions`, {
       method: "POST",
@@ -552,11 +564,7 @@ async function chatJSON(system, user, jsonSchema) {
       body: JSON.stringify({
         model: OPENAI_MODEL_JSON,
         messages: [
-          {
-            role: "system",
-            content:
-              "Geef ALLEEN geldige JSON terug, zonder tekst of uitleg. Houd je strikt aan het gevraagde schema; ontbrekend = null/lege waarde.",
-          },
+          { role: "system", content: "Geef ALLEEN geldige JSON terug, zonder tekst of uitleg." },
           { role: "user", content: `${system}\n\n${user}\n\nAntwoord uitsluitend met JSON.` },
         ],
         temperature: 0,
@@ -572,23 +580,12 @@ async function chatJSON(system, user, jsonSchema) {
 
   const j = await res.json();
   const txt = j?.choices?.[0]?.message?.content || "{}";
-  try {
-    return JSON.parse(txt);
-  } catch {
-    return {};
-  }
+  try { return JSON.parse(txt); } catch { return {}; }
 }
 
 async function safeErrorText(res) {
-  try {
-    const t = await res.text();
-    return t?.slice(0, 400);
-  } catch {
-    return "";
-  }
+  try { return (await res.text())?.slice(0, 400); } catch { return ""; }
 }
-
-/* -------------------- Streaming helper -------------------- */
 
 async function streamOpenAI({ prompt, onDelta }) {
   const res = await fetch(`${OPENAI_API_BASE}/chat/completions`, {
@@ -604,8 +601,7 @@ async function streamOpenAI({ prompt, onDelta }) {
       messages: [
         {
           role: "system",
-          content:
-            "Je schrijft compacte, praktische paklijsten in het Nederlands. Gebruik secties: Korte samenvatting, Kleding, Gear, Gadgets, Health, Tips. Geen disclaimers.",
+          content: "Je schrijft compacte, praktische paklijsten in het Nederlands. Gebruik secties: Korte samenvatting, Kleding, Gear, Gadgets, Health, Tips. Geen disclaimers.",
         },
         { role: "user", content: prompt },
       ],
