@@ -11,8 +11,10 @@ export const runtime = "edge";
  *
  * +++ Toegevoegd in deze versie +++
  * - Seasons CSV integratie via SEASONS_CSV_URL
- * - computeSeasonInfo(context, seasonsTable) → { season, seasonalRisks, adviceFlags, itemTags }
+ * - computeSeasonInfoForContext(context, seasonsTable) → { season, seasonalRisks, adviceFlags, itemTags }
  * - Mergen van LLM-derived context met seasons-CSV context in de twee `send("context", ...)` momenten
+ * - Prompt-injectie: seizoenscontext als extra systemregel voor de LLM
+ * - Bugfix: followupQuestion gebruikte per ongeluk `ctx`
  */
 
 const OPENAI_API_BASE = "https://api.openai.com/v1";
@@ -114,12 +116,14 @@ export async function POST(req) {
 
           if (missing.length > 0) {
             const followupQ = followupQuestion({ missing, context: safeContext });
+
             // ⬇️ stuur ALLEEN de delta terug (frontend deep-merge beschermt bestaande waarden)
             send("needs", { missing, contextOut: extracted?.context || {} });
 
-            // 👉 seasons + derived samensturen
+            // seasons + derived samensturen (frontend toont b.v. seizoenhint)
             const derived = await derivedContext(safeContext);
             const seasonsCtx = await seasonsContextFor(safeContext);
+
             send("ask", { question: followupQ, missing });
             send("context", { ...derived, ...seasonsCtx });
 
@@ -140,6 +144,7 @@ export async function POST(req) {
         // Wizard back-compat (direct genereren)
         const prompt = hasDirectPrompt ? body.prompt.trim() : buildPromptFromContext(safeContext);
         const missing = missingSlots(safeContext);
+
         if (!hasDirectPrompt && missing.length > 0) {
           const followupQ = followupQuestion({ missing, context: safeContext });
           const derived = await derivedContext(safeContext);
@@ -254,6 +259,8 @@ async function extractSlots({ utterance, context }) {
   if (dateRange) {
     const [, d1, mo1, y1, d2, mo2, y2] = dateRange;
     baseline.context.startDate = toISO(y1, mo1, d1);
+    baseline.context.endDate   = toISO(y2, mo2, y2.length === 2 ? y2 : d2); // defensief
+    // ^ je mag evt. je eerdere toISO-call behouden; hier vooral defensief zijn.
     baseline.context.endDate   = toISO(y2, mo2, d2);
   }
 
@@ -310,12 +317,12 @@ function followupQuestion({ missing, context }) {
   if (context?.destination?.country) pref.push(`bestemming: ${context.destination.country}`);
   if (context?.durationDays) pref.push(`duur: ${context.durationDays} dagen`);
   if (context?.month) pref.push(`maand: ${context.month}`);
-  if (context?.startDate && ctx?.endDate) pref.push(`data: ${context.startDate} t/m ${context.endDate}`);
+  if (context?.startDate && context?.endDate) pref.push(`data: ${context.startDate} t/m ${context.endDate}`);
   const hint = pref.length ? ` (bekend: ${pref.join(", ")})` : "";
   return `Kun je nog aangeven: ${labels.join(", ")}?${hint}`;
 }
 
-/* -------------------- Afgeleide context -------------------- */
+/* -------------------- Afgeleide context (LLM) -------------------- */
 
 async function derivedContext(ctx) {
   const sys =
@@ -358,7 +365,7 @@ async function loadSeasonsTable() {
   const res = await fetch(SEASONS_CSV_URL, { cache: "no-store" });
   if (!res.ok) return [];
   const text = await res.text();
-  const rows = parseCsv(text); // hergebruik bestaande, robuuste CSV-parser
+  const rows = parseCsv(text); // hergebruik bestaande CSV-parser
   __SEASONS_CACHE__ = { rows, at: Date.now() };
   return rows;
 }
@@ -401,14 +408,16 @@ function computeSeasonInfoForContext(ctx, table) {
 
   const C = normStr(country);
   const R = normStr(region);
+
   const hits = table.filter((r) => {
     const rc = normStr(r.country);
     const rr = normStr(r.region);
     const regionMatch = rr ? (rc === C && rr === R) : (rc === C);
-    return regionMatch && inSeasonEN(r.start_month, r.start_month, r.end_month) && inSeasonEN(monthAbbrev, r.start_month, r.end_month);
+    return regionMatch && inSeasonEN(monthAbbrev, r.start_month, r.end_month);
   });
 
   const climate = hits.find(h => String(h.type).toLowerCase() === "climate")?.label || null;
+
   const risks = hits
     .filter(h => String(h.type).toLowerCase() === "risk")
     .map(h => ({
@@ -435,20 +444,47 @@ function computeSeasonInfoForContext(ctx, table) {
   return { season: climate, seasonalRisks: risks, adviceFlags: flags, itemTags: Array.from(items) };
 }
 
+/* -------------------- Prompt-injectie seizoenscontext -------------------- */
+
+function seasonPromptLines(seasonsCtx) {
+  const bits = [];
+  if (seasonsCtx?.season) {
+    bits.push(`Seizoenscontext: ${seasonsCtx.season}.`);
+  }
+  if (Array.isArray(seasonsCtx?.seasonalRisks) && seasonsCtx.seasonalRisks.length) {
+    const top = seasonsCtx.seasonalRisks[0];
+    const lvl = top.level ? ` (${top.level})` : "";
+    bits.push(`Belangrijke risico's: ${top.type}${lvl}.`);
+  }
+  if (!bits.length) return [];
+  return [
+    {
+      role: "system",
+      content:
+        `Gebruik deze seizoenscontext expliciet in de adviezen en paklijst (kleding/gear/health/tips). ` +
+        bits.join(" "),
+    },
+  ];
+}
+
 /* -------------------- Generate & Stream -------------------- */
 
 async function generateAndStream({ controller, send, req, prompt, context }) {
   const derived = await derivedContext(context);
   const seasonsCtx = await seasonsContextFor(context);
 
-  // samen versturen
+  // samen versturen (frontend hint + eventuele extra velden)
   send("context", { ...derived, ...seasonsCtx });
+
+  // Bouw systemExtras met seizoensregels zodat de LLM het ook echt gebruikt
+  const systemExtras = seasonPromptLines(seasonsCtx);
 
   send("start", {});
   try {
     await streamOpenAI({
       prompt,
       onDelta: (chunk) => send("delta", chunk),
+      systemExtras, // 👈 inject
     });
   } catch (e) {
     send("error", { message: e?.message || "Fout bij genereren" });
@@ -713,7 +749,7 @@ async function safeErrorText(res) {
   try { return (await res.text())?.slice(0, 400); } catch { return ""; }
 }
 
-async function streamOpenAI({ prompt, onDelta }) {
+async function streamOpenAI({ prompt, onDelta, systemExtras = [] }) {
   const res = await fetch(`${OPENAI_API_BASE}/chat/completions`, {
     method: "POST",
     headers: {
@@ -725,9 +761,12 @@ async function streamOpenAI({ prompt, onDelta }) {
       stream: true,
       temperature: 0.4,
       messages: [
+        // 👇 extra systemregels met seizoenscontext eerst
+        ...systemExtras.map((m) => ({ role: "system", content: m.content || m })),
         {
           role: "system",
-          content: "Je schrijft compacte, praktische paklijsten in het Nederlands. Gebruik secties: Korte samenvatting, Kleding, Gear, Gadgets, Health, Tips. Geen disclaimers.",
+          content:
+            "Je schrijft compacte, praktische paklijsten in het Nederlands. Gebruik secties: Korte samenvatting, Kleding, Gear, Gadgets, Health, Tips. Geen disclaimers.",
         },
         { role: "user", content: prompt },
       ],
