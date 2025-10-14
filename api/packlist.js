@@ -8,6 +8,11 @@ export const runtime = "edge";
  * - needs.contextOut stuurt ALLEEN de delta (frontend deep-merge)
  * - CSV-producten uit /public/pack_products.csv of env PRODUCTS_CSV_URL (Google Sheets Raw/Export)
  * - Debugregel voor CSV/filters + batching + graceful fallback
+ *
+ * +++ Toegevoegd in deze versie +++
+ * - Seasons CSV integratie via SEASONS_CSV_URL
+ * - computeSeasonInfo(context, seasonsTable) → { season, seasonalRisks, adviceFlags, itemTags }
+ * - Mergen van LLM-derived context met seasons-CSV context in de twee `send("context", ...)` momenten
  */
 
 const OPENAI_API_BASE = "https://api.openai.com/v1";
@@ -111,8 +116,13 @@ export async function POST(req) {
             const followupQ = followupQuestion({ missing, context: safeContext });
             // ⬇️ stuur ALLEEN de delta terug (frontend deep-merge beschermt bestaande waarden)
             send("needs", { missing, contextOut: extracted?.context || {} });
+
+            // 👉 seasons + derived samensturen
+            const derived = await derivedContext(safeContext);
+            const seasonsCtx = await seasonsContextFor(safeContext);
             send("ask", { question: followupQ, missing });
-            send("context", await derivedContext(safeContext));
+            send("context", { ...derived, ...seasonsCtx });
+
             controller.close();
             return;
           }
@@ -132,9 +142,13 @@ export async function POST(req) {
         const missing = missingSlots(safeContext);
         if (!hasDirectPrompt && missing.length > 0) {
           const followupQ = followupQuestion({ missing, context: safeContext });
+          const derived = await derivedContext(safeContext);
+          const seasonsCtx = await seasonsContextFor(safeContext);
+
           send("needs", { missing, contextOut: {} });
           send("ask", { question: followupQ, missing });
-          send("context", await derivedContext(safeContext));
+          send("context", { ...derived, ...seasonsCtx });
+
           controller.close();
           return;
         }
@@ -312,11 +326,123 @@ async function derivedContext(ctx) {
   return json;
 }
 
+/* -------------------- Seasons CSV integratie (NIEUW) -------------------- */
+/** Verwacht kolommen (enriched):
+ * country,region,type,label,level,start_month,end_month,advice_flags,item_tags,note
+ */
+const SEASONS_CSV_URL = (process.env.SEASONS_CSV_URL || "").trim();
+const SEASONS_TTL_MS = 6 * 60 * 60 * 1000; // 6 uur
+const MONTHS_EN = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+const NL2EN = {
+  januari:"Jan", februari:"Feb", maart:"Mar", april:"Apr", mei:"May", juni:"Jun",
+  juli:"Jul", augustus:"Aug", september:"Sep", oktober:"Oct", november:"Nov", december:"Dec"
+};
+let __SEASONS_CACHE__ = { rows: null, at: 0 };
+
+async function seasonsContextFor(ctx) {
+  try {
+    const tbl = await loadSeasonsTable();
+    if (!tbl || !tbl.length) return {};
+    const out = computeSeasonInfoForContext(ctx, tbl);
+    return out || {};
+  } catch {
+    return {};
+  }
+}
+
+async function loadSeasonsTable() {
+  if (!SEASONS_CSV_URL) return [];
+  if (__SEASONS_CACHE__.rows && Date.now() - __SEASONS_CACHE__.at < SEASONS_TTL_MS) {
+    return __SEASONS_CACHE__.rows;
+  }
+  const res = await fetch(SEASONS_CSV_URL, { cache: "no-store" });
+  if (!res.ok) return [];
+  const text = await res.text();
+  const rows = parseCsv(text); // hergebruik bestaande, robuuste CSV-parser
+  __SEASONS_CACHE__ = { rows, at: Date.now() };
+  return rows;
+}
+
+function monthAbbrevFromContext(ctx) {
+  if (ctx?.month) {
+    const m = String(ctx.month).toLowerCase().trim();
+    return NL2EN[m] || MONTHS_EN.find(mm => mm.toLowerCase().startsWith(m.slice(0,3))) || null;
+  }
+  if (ctx?.startDate) {
+    try {
+      const d = new Date(ctx.startDate);
+      return MONTHS_EN[d.getUTCMonth()];
+    } catch {}
+  }
+  return null;
+}
+
+function normStr(s) {
+  return String(s || "")
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .trim();
+}
+
+function inSeasonEN(monthAbbrev, start, end) {
+  if (!monthAbbrev || !start || !end) return false;
+  const idx = (m) => MONTHS_EN.indexOf(m) + 1;
+  const m = idx(monthAbbrev), a = idx(start), b = idx(end);
+  if (!m || !a || !b) return false;
+  return a <= b ? (m >= a && m <= b) : (m >= a || m <= b);
+}
+
+function computeSeasonInfoForContext(ctx, table) {
+  const country = ctx?.destination?.country;
+  const region = ctx?.destination?.region;
+  const monthAbbrev = monthAbbrevFromContext(ctx);
+  if (!country || !monthAbbrev) return null;
+
+  const C = normStr(country);
+  const R = normStr(region);
+  const hits = table.filter((r) => {
+    const rc = normStr(r.country);
+    const rr = normStr(r.region);
+    const regionMatch = rr ? (rc === C && rr === R) : (rc === C);
+    return regionMatch && inSeasonEN(r.start_month, r.start_month, r.end_month) && inSeasonEN(monthAbbrev, r.start_month, r.end_month);
+  });
+
+  const climate = hits.find(h => String(h.type).toLowerCase() === "climate")?.label || null;
+  const risks = hits
+    .filter(h => String(h.type).toLowerCase() === "risk")
+    .map(h => ({
+      type: String(h.label || "").toLowerCase(),
+      level: String(h.level || "unknown").toLowerCase(),
+      note: h.note || ""
+    }));
+
+  const flags = {};
+  const items = new Set();
+  for (const h of hits) {
+    String(h.advice_flags || "")
+      .split(",")
+      .map(s => s.trim())
+      .filter(Boolean)
+      .forEach(f => flags[f] = true);
+    String(h.item_tags || "")
+      .split(",")
+      .map(s => s.trim())
+      .filter(Boolean)
+      .forEach(t => items.add(t));
+  }
+
+  return { season: climate, seasonalRisks: risks, adviceFlags: flags, itemTags: Array.from(items) };
+}
+
 /* -------------------- Generate & Stream -------------------- */
 
 async function generateAndStream({ controller, send, req, prompt, context }) {
   const derived = await derivedContext(context);
-  send("context", derived);
+  const seasonsCtx = await seasonsContextFor(context);
+
+  // samen versturen
+  send("context", { ...derived, ...seasonsCtx });
 
   send("start", {});
   try {
@@ -351,7 +477,8 @@ async function generateAndStream({ controller, send, req, prompt, context }) {
     }]);
   }
 
-  send("context", { ...derived });
+  // nogmaals context terugsturen (zoals je deed), nu ook met seasons
+  send("context", { ...derived, ...seasonsCtx });
   send("done", {});
   controller.close();
 }
