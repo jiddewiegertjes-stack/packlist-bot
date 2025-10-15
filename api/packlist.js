@@ -15,6 +15,11 @@ export const runtime = "edge";
  * - Mergen van LLM-derived context met seasons-CSV context in de twee `send("context", ...)` momenten
  * - Prompt-injectie: seizoenscontext als extra systemregel voor de LLM
  * - Bugfix: followupQuestion gebruikte per ongeluk `ctx`
+ *
+ * +++ NIEUW (chat-achtig) +++
+ * - Ondersteuning voor `history` (volledige chatgesprek) in de request body.
+ * - `generateAndStream` en `streamOpenAI` kunnen nu óf een enkel `prompt` óf een `messages`-array gebruiken.
+ * - `sanitizeHistory` beschermt tegen foutieve rollen/format en limiteert lengte.
  */
 
 const OPENAI_API_BASE = "https://api.openai.com/v1";
@@ -107,6 +112,9 @@ export async function POST(req) {
       const hasDirectPrompt =
         typeof body?.prompt === "string" && body.prompt.trim().length > 0;
 
+      // ✨ NIEUW: optionele conversatiegeschiedenis van de frontend
+      const history = sanitizeHistory(body?.history);
+
       try {
         // Vrije-tekst (slot-filling)
         if (!hasDirectPrompt && message) {
@@ -137,6 +145,8 @@ export async function POST(req) {
             req,
             prompt: buildPromptFromContext(safeContext),
             context: safeContext,
+            history, // ✨ meegeven
+            lastUserMessage: message, // ✨ zodat model weet wat er net gezegd is
           });
           return;
         }
@@ -158,7 +168,7 @@ export async function POST(req) {
           return;
         }
 
-        await generateAndStream({ controller, send, req, prompt, context: safeContext });
+        await generateAndStream({ controller, send, req, prompt, context: safeContext, history });
       } catch (e) {
         closeWithError(e?.message || "Onbekende fout");
       }
@@ -259,8 +269,6 @@ async function extractSlots({ utterance, context }) {
   if (dateRange) {
     const [, d1, mo1, y1, d2, mo2, y2] = dateRange;
     baseline.context.startDate = toISO(y1, mo1, d1);
-    baseline.context.endDate   = toISO(y2, mo2, y2.length === 2 ? y2 : d2); // defensief
-    // ^ je mag evt. je eerdere toISO-call behouden; hier vooral defensief zijn.
     baseline.context.endDate   = toISO(y2, mo2, d2);
   }
 
@@ -469,7 +477,7 @@ function seasonPromptLines(seasonsCtx) {
 
 /* -------------------- Generate & Stream -------------------- */
 
-async function generateAndStream({ controller, send, req, prompt, context }) {
+async function generateAndStream({ controller, send, req, prompt, context, history, lastUserMessage }) {
   const derived = await derivedContext(context);
   const seasonsCtx = await seasonsContextFor(context);
 
@@ -481,10 +489,19 @@ async function generateAndStream({ controller, send, req, prompt, context }) {
 
   send("start", {});
   try {
-    await streamOpenAI({
+    // ✨ Als history is aangeleverd: gebruik volledige conversatie
+    // Anders: val terug op één enkele user-prompt (oude gedrag).
+    const messages = buildMessagesForOpenAI({
+      systemExtras,
       prompt,
+      history,
+      contextSummary: summarizeContext(context),
+      lastUserMessage,
+    });
+
+    await streamOpenAI({
+      messages,
       onDelta: (chunk) => send("delta", chunk),
-      systemExtras, // 👈 inject
     });
   } catch (e) {
     send("error", { message: e?.message || "Fout bij genereren" });
@@ -517,6 +534,42 @@ async function generateAndStream({ controller, send, req, prompt, context }) {
   send("context", { ...derived, ...seasonsCtx });
   send("done", {});
   controller.close();
+}
+
+/* ---------- Context samenvatting (inject als system) ---------- */
+function summarizeContext(ctx) {
+  const parts = [];
+  if (ctx?.destination?.country) parts.push(`land: ${ctx.destination.country}`);
+  if (ctx?.destination?.region) parts.push(`regio: ${ctx.destination.region}`);
+  if (ctx?.durationDays) parts.push(`duur: ${ctx.durationDays} dagen`);
+  if (ctx?.month) parts.push(`maand: ${ctx.month}`);
+  if (ctx?.startDate && ctx?.endDate) parts.push(`data: ${ctx.startDate} t/m ${ctx.endDate}`);
+  if (Array.isArray(ctx?.activities) && ctx.activities.length) parts.push(`activiteiten: ${ctx.activities.join(", ")}`);
+  if (!parts.length) return null;
+  return `Bekende context (${parts.join(" • ")}). Gebruik dit impliciet bij je advies als het relevant is.`;
+}
+
+/* ---------- Bouw OpenAI messages ---------- */
+function buildMessagesForOpenAI({ systemExtras = [], prompt, history, contextSummary, lastUserMessage }) {
+  const baseSystem = {
+    role: "system",
+    content:
+      "Je schrijft compacte, praktische paklijsten in het Nederlands. Gebruik secties: Korte samenvatting, Kleding, Gear, Gadgets, Health, Tips. Geen disclaimers.",
+  };
+
+  const extras = (systemExtras || []).map((m) => ({ role: "system", content: m.content || m }));
+
+  const ctxMsg = contextSummary ? [{ role: "system", content: contextSummary }] : [];
+
+  if (history && history.length) {
+    // Gebruik aangeleverde conversatie en sluit af met de laatste userboodschap (indien apart meegegeven)
+    const hist = history.map((m) => ({ role: m.role, content: String(m.content || "").slice(0, 8000) }));
+    const tail = lastUserMessage ? [{ role: "user", content: String(lastUserMessage).slice(0, 8000) }] : [];
+    return [...extras, baseSystem, ...ctxMsg, ...hist, ...tail];
+  }
+
+  // Back-compat: geen history → enkel prompt als user
+  return [...extras, baseSystem, ...ctxMsg, { role: "user", content: prompt }];
 }
 
 /* -------------------- CSV producten -------------------- */
@@ -698,6 +751,21 @@ function splitCsvLine(line) {
 
 /* -------------------- OpenAI helpers -------------------- */
 
+// ✨ NIEUW: veilige history-acceptatie
+function sanitizeHistory(raw) {
+  if (!Array.isArray(raw)) return null;
+  const ok = [];
+  for (const m of raw) {
+    const role = (m && m.role) || "";
+    const content = (m && m.content) || "";
+    if (!content) continue;
+    if (role !== "user" && role !== "assistant") continue; // alleen deze 2 rollen toestaan
+    ok.push({ role, content: String(content).slice(0, 8000) });
+    if (ok.length >= 24) break; // limiter
+  }
+  return ok.length ? ok : null;
+}
+
 async function chatJSON(system, user, jsonSchema) {
   let res = await fetch(`${OPENAI_API_BASE}/chat/completions`, {
     method: "POST",
@@ -749,7 +817,12 @@ async function safeErrorText(res) {
   try { return (await res.text())?.slice(0, 400); } catch { return ""; }
 }
 
-async function streamOpenAI({ prompt, onDelta, systemExtras = [] }) {
+// ✨ VERNIEUWD: accepteert nu 'messages' (history + prompt) i.p.v. alleen 'prompt'
+async function streamOpenAI({ messages, onDelta }) {
+  if (!Array.isArray(messages) || messages.length === 0) {
+    throw new Error("Missing messages for OpenAI");
+  }
+
   const res = await fetch(`${OPENAI_API_BASE}/chat/completions`, {
     method: "POST",
     headers: {
@@ -760,16 +833,7 @@ async function streamOpenAI({ prompt, onDelta, systemExtras = [] }) {
       model: OPENAI_MODEL_TEXT,
       stream: true,
       temperature: 0.4,
-      messages: [
-        // 👇 extra systemregels met seizoenscontext eerst
-        ...systemExtras.map((m) => ({ role: "system", content: m.content || m })),
-        {
-          role: "system",
-          content:
-            "Je schrijft compacte, praktische paklijsten in het Nederlands. Gebruik secties: Korte samenvatting, Kleding, Gear, Gadgets, Health, Tips. Geen disclaimers.",
-        },
-        { role: "user", content: prompt },
-      ],
+      messages,
     }),
   });
   if (!res.ok || !res.body) throw new Error(`OpenAI stream error: ${res.status}`);
