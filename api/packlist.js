@@ -336,6 +336,10 @@ export default function PacklistAssistant({ showHint = true }: { showHint?: bool
   const [selected, setSelected] = React.useState<Record<string, boolean>>({})
   const abortRef = React.useRef<AbortController | null>(null)
 
+  // Dedupe & control where questions come from
+  const [lastAskKey, setLastAskKey] = React.useState<string | null>(null)
+  const [backendAskMode, setBackendAskMode] = React.useState<boolean>(false)
+
   const [context, setContext] = React.useState<Ctx>({
     destination: { country: null, region: null },
     durationDays: null,
@@ -381,6 +385,12 @@ export default function PacklistAssistant({ showHint = true }: { showHint?: bool
     }[order]
   }
 
+  function askOnce(key: string, text: string) {
+    if (lastAskKey === key) return
+    setLastAskKey(key)
+    pushAssistantText(text)
+  }
+
   /* ---------- Backend trigger with nluHints ---------- */
   async function sendToBackend(message: string, nluHints: NLUHints, history: any[]) {
     setRunning(true); setThinking(true)
@@ -403,6 +413,46 @@ export default function PacklistAssistant({ showHint = true }: { showHint?: bool
           if (line.startsWith("event:")) ev = line.slice(6).trim()
           else if (line.startsWith("data:")) dataRaw += line.slice(5)
         }
+        if (ev === "ask") {
+          // Prefer backend follow-up questions; suppress local ones to avoid duplicates
+          setBackendAskMode(true)
+          try {
+            const payload = JSON.parse(dataRaw) as { question?: string }
+            const q = payload?.question?.trim()
+            if (q) askOnce(`ask:${q}`, q)
+          } catch {}
+        } else if (ev === "needs") {
+          try { const payload = JSON.parse(dataRaw) as ContextPayload
+            const { season, seasonalRisks, adviceFlags, itemTags, ...rest } = payload || {}
+            if (Object.keys(rest).length) setContext(c => deepMerge(c, rest))
+          } catch {}
+        } else if (ev === "start") {
+          hasStarted = true; streamedText = ""; pushAssistantHTML(formatToChatUI(""))
+        } else if (ev === "delta" && hasStarted) {
+          let add = ""; try { const maybe = JSON.parse(dataRaw); add = typeof maybe === "string" ? maybe : (maybe as any)?.text ?? dataRaw } catch { add = dataRaw }
+          streamedText += add
+          setMessages(msgs => {
+            const copy = [...msgs]
+            for (let i = copy.length - 1; i >= 0; i--) if (copy[i].role === "assistant" && "html" in copy[i]) { copy[i] = { role: "assistant", html: formatToChatUI(streamedText) }; break }
+            return copy
+          })
+        } else if (ev === "products") {
+          try { const incoming = (JSON.parse(dataRaw) as ProductsEvent) || []
+            setProducts(prev => {
+              const seen = new Set<string>()
+              const out: Product[] = []
+              for (const p of [...(prev||[]), ...incoming]) {
+                const key = `${(p.name||"")}|${(p.url||"")}`.toLowerCase()
+                if (!seen.has(key) && !/(\.csv($|\?)|docs.google.com\/spreadsheets|export=download&format=csv)/.test((p.url||"").toLowerCase())) { seen.add(key); out.push(p) }
+              }
+              return out
+            })
+          } catch {}
+        } else if (ev === "error") {
+          try { setError((JSON.parse(dataRaw) as any)?.message || "Onbekende fout uit stream") } catch { setError(dataRaw || "Onbekende fout uit stream") }
+          break
+        } else if (ev === "done") { break }
+      }
         if (ev === "needs") {
           try { const payload = JSON.parse(dataRaw) as ContextPayload
             const { season, seasonalRisks, adviceFlags, itemTags, ...rest } = payload || {}
@@ -453,42 +503,33 @@ export default function PacklistAssistant({ showHint = true }: { showHint?: bool
     setInput("")
     resetTurnSideEffects()
 
-    // NLU pass
+    // NLU pass (lightweight). We let the LLM interpolate/understand vague phrasing.
     const hints = nlu(message, context)
     const intent = detectIntent(message)
 
-    // Apply local context updates optimistically
+    // Optimistic local context updates (non-destructive)
     if (hints.country) setContext(c => deepMerge(c, { destination: { country: hints.country, region: null } }))
     if (hints.durationDays) setContext(c => deepMerge(c, { durationDays: hints.durationDays }))
     if (hints.month || hints.startDate) setContext(c => deepMerge(c, { month: hints.month ?? null, startDate: hints.startDate ?? null, endDate: hints.endDate ?? null }))
     if (hints.activitiesAdd?.length || hints.activitiesRemove?.length) setContext(c => ({
       ...c,
-      activities: Array.from(new Set([...
-        (c.activities||[]).filter(a => !(hints.activitiesRemove||[]).includes(a)),
-        ...(hints.activitiesAdd||[])
-      ]))
+      activities: Array.from(new Set([...(c.activities||[]).filter(a => !(hints.activitiesRemove||[]).includes(a)), ...(hints.activitiesAdd||[])]))
     }))
 
-    const miss = missingSlots()
+    // Always stream to backend so the LLM can reason & interpolate.
+    const history = buildHistory([...messages, { role: "user", text: message }])
+    const enrichedHints = { ...hints, policy: { allowApproximate: true, preferLLMInference: true } } as any
 
-    // Conversational follow‑up
     if (intent === "update" && hints.paraphrase) {
       pushAssistantText(`${hints.paraphrase} Aangepast! Ik denk mee…`)
-      return sendToBackend("Update door gebruiker", hints, buildHistory([...messages, { role: "user", text: message }]))
+      return sendToBackend("Update door gebruiker", enrichedHints, history)
     }
 
-    // If high confidence or nothing missing → stream backend answer
-    if (hints.confidence >= 0.6 || miss.length === 0) {
-      if (hints.paraphrase) pushAssistantText(`${hints.paraphrase} Top, ik heb genoeg info. Ik denk mee…`)
-      else pushAssistantText("Top, ik heb genoeg info. Ik denk mee…")
-      return sendToBackend(message, hints, buildHistory([...messages, { role: "user", text: message }]))
-    }
+    // Give a short paraphrase but do NOT ask locally; let backend ask if needed
+    if (hints.paraphrase) pushAssistantText(`${hints.paraphrase} Ik denk mee…`)
+    else pushAssistantText("Ik denk mee…")
 
-    // Otherwise ask the next best question, but with a paraphrase to feel human
-    const follow = nextQuestion()
-    if (follow) {
-      pushAssistantText(hints.paraphrase ? `${hints.paraphrase}\n${follow}` : follow)
-    }
+    return sendToBackend(message, enrichedHints, history)
   }
 
   /* ---------- UI (trimmed) ---------- */
