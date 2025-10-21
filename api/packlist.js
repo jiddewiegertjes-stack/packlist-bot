@@ -1,852 +1,762 @@
-export const runtime = "edge";
+import * as React from "react"
 
 /**
- * Packlist SSE + Slot-Filling Chat Backend (Edge)
- * ------------------------------------------------
- * Deze versie laat het LLM *ChatGPT‑achtiger* gedragen:
- * - Neemt `history` én `nluHints` aan vanuit de frontend.
- * - Geeft het model expliciete toestemming om vage taal te interpreteren
- *   (bv. "paar maanden", "rond de jaarwisseling").
- * - Doorbreekt de `ask`-loop zodra er voldoende signaal is (duration/period).
- * - Injecteert seizoenscontext als extra systemregel.
+ * PacklistAssistant — Advies óók bij ontbrekende info
+ * - Stuurt altijd naar backend (policy: allowPartial, preferAdviceOverQuestions)
+ * - Herkent "weet ik (nog) niet" en onderdrukt vervolgvragen over die slots
+ * - Dedupe/throttle van 'ask' SSE-events (max 1 per beurt, geen repeats)
+ * - Toont optioneel 'assumptions' (als backend dat event stuurt)
  */
 
-const OPENAI_API_BASE = "https://api.openai.com/v1";
-const OPENAI_MODEL_TEXT = process.env.OPENAI_MODEL_TEXT || "gpt-4o-mini";
-const OPENAI_MODEL_JSON = process.env.OPENAI_MODEL_JSON || "gpt-4o-mini";
-const enc = new TextEncoder();
+const API_BASE = "https://packlist-bot.vercel.app" // jouw backend
 
-/* --------------------------- CORS helpers --------------------------- */
+/* ---------- Types ---------- */
+type Product = {
+  category?: string
+  name?: string
+  weight_grams?: number
+  activities?: string
+  seasons?: string
+  url?: string
+  image?: string
+}
+type ProductsEvent = Product[]
+type NeedsPayload = { missing?: string[]; contextOut?: any }
 
-const ALLOWED_ORIGINS = [
-  "https://*.framer.website",
-  "https://*.framer.app",
-  "https://*.framer.media",
-  "https://*.vercel.app",
-  "https://trekvice.com",
-  "http://localhost:3000",
-  "http://127.0.0.1:3000",
-];
-
-function originAllowed(origin = "") {
-  if (!origin) return false;
-  return ALLOWED_ORIGINS.some((pat) => {
-    if (pat.includes("*")) {
-      const rx = new RegExp("^" + pat.replace(/\./g, "\\.").replace(/\*/g, ".*") + "$");
-      return rx.test(origin);
-    }
-    return origin === pat;
-  });
+type SeasonalRisk = { type: string; level?: string; note?: string }
+type ContextPayload = {
+  season?: string | null
+  seasonalRisks?: SeasonalRisk[]
+  adviceFlags?: Record<string, boolean>
+  itemTags?: string[]
+  [k: string]: any
 }
 
-function corsHeaders(req) {
-  const origin = req.headers.get("origin") || "";
-  const allowOrigin = originAllowed(origin) ? origin : "*";
-  return {
-    "Access-Control-Allow-Origin": allowOrigin,
-    "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization, x-session-id",
-    "Access-Control-Allow-Credentials": "true",
-  };
+type ChatMsg = { role: "user" | "assistant"; html?: string; text?: string }
+type OpenAIHistoryMsg = { role: "user" | "assistant"; content: string }
+
+type StepId = "countries" | "period" | "duration" | "activities"
+const ASK_ORDER: readonly StepId[] = ["countries", "period", "duration", "activities"]
+
+/* ---------- Policy voor 'partial advice' ---------- */
+type GuidancePolicy = {
+  allowPartial: boolean
+  preferAdviceOverQuestions: boolean
+  questionsOnlyWhenBlocking: boolean
+  showAlternatives: boolean
+  assumptions: { allowed: boolean; mustBeExplicit: boolean; max: number }
+}
+const DEFAULT_POLICY: GuidancePolicy = {
+  allowPartial: true,
+  preferAdviceOverQuestions: true,
+  questionsOnlyWhenBlocking: true,
+  showAlternatives: true,
+  assumptions: { allowed: true, mustBeExplicit: true, max: 5 },
 }
 
-export async function OPTIONS(req) {
-  return new Response(null, {
-    status: 204,
-    headers: {
-      ...corsHeaders(req),
-      "Cache-Control": "no-store",
-      "Content-Length": "0",
-    },
-  });
-}
-
-export async function GET(req) {
-  return new Response(JSON.stringify({ ok: true }), {
-    status: 200,
-    headers: {
-      "Content-Type": "application/json",
-      ...corsHeaders(req),
-    },
-  });
-}
-
-/* ------------------------------ POST ------------------------------- */
-
-export async function POST(req) {
-  const stream = new ReadableStream({
-    async start(controller) {
-      const send = (event, data) => {
-        const payload =
-          data === undefined
-            ? `event: ${event}\n\n`
-            : `event: ${event}\n` +
-              `data: ${typeof data === "string" ? data : JSON.stringify(data)}\n\n`;
-        controller.enqueue(enc.encode(payload));
-      };
-      const closeWithError = (msg) => {
-        try { send("error", { message: msg }); } catch {}
-        controller.close();
-      };
-
-      let body;
-      try {
-        body = await req.json();
-      } catch {
-        return closeWithError("Invalid JSON body");
-      }
-
-      const safeContext = normalizeContext(body?.context);
-      const message = (body?.message || "").trim();
-      const hasDirectPrompt = typeof body?.prompt === "string" && body.prompt.trim().length > 0;
-
-      // Conversatiegeschiedenis en hints uit de frontend
-      const history = sanitizeHistory(body?.history);
-      const nluHints = body?.nluHints || null; // <— NIEUW
-
-      try {
-        // Vrije tekst pad (slot-filling)
-        if (!hasDirectPrompt && message) {
-          const extracted = await extractSlots({ utterance: message, context: safeContext });
-          mergeInto(safeContext, extracted?.context || {});
-          const missing = missingSlots(safeContext);
-
-          // Kijk of er taalsignaal is waardoor we níet hoeven te vragen
-          const userLower = message.toLowerCase();
-          const hasDurationSignal =
-            !!nluHints?.durationDays ||
-            !!nluHints?.durationPhrase ||
-            /\b(weekje|maandje|paar\s*weken|paar\s*maanden)\b/.test(userLower);
-          const hasPeriodSignal =
-            !!nluHints?.month ||
-            !!nluHints?.startDate ||
-            !!nluHints?.periodPhrase ||
-            /\brond\s+de\s+jaarwisseling|rond\s+kerst|oud.*nieuw\b/.test(userLower);
-
-          const stillMissing = missing.filter((m) =>
-            (m === "durationDays" && !hasDurationSignal) ||
-            (m === "period" && !hasPeriodSignal) ||
-            (m === "destination.country")
-          );
-
-          if (stillMissing.length > 0) {
-            const followupQ = followupQuestion({ missing: stillMissing, context: safeContext });
-            send("needs", { missing: stillMissing, contextOut: extracted?.context || {} });
-            const derived = await derivedContext(safeContext);
-            const seasonsCtx = await seasonsContextFor(safeContext);
-            send("ask", { question: followupQ, missing: stillMissing });
-            send("context", { ...derived, ...seasonsCtx });
-            controller.close();
-            return;
-          }
-
-          await generateAndStream({
-            controller,
-            send,
-            req,
-            prompt: buildPromptFromContext(safeContext),
-            context: safeContext,
-            history,
-            lastUserMessage: message,
-            nluHints, // <— meegeven
-          });
-          return;
-        }
-
-        // Wizard back-compat (direct genereren)
-        const prompt = hasDirectPrompt ? body.prompt.trim() : buildPromptFromContext(safeContext);
-        const missing = missingSlots(safeContext);
-
-        if (!hasDirectPrompt && missing.length > 0) {
-          const followupQ = followupQuestion({ missing, context: safeContext });
-          const derived = await derivedContext(safeContext);
-          const seasonsCtx = await seasonsContextFor(safeContext);
-          send("needs", { missing, contextOut: {} });
-          send("ask", { question: followupQ, missing });
-          send("context", { ...derived, ...seasonsCtx });
-          controller.close();
-          return;
-        }
-
-        await generateAndStream({ controller, send, req, prompt, context: safeContext, history, nluHints });
-      } catch (e) {
-        closeWithError(e?.message || "Onbekende fout");
-      }
-    },
-  });
-
-  return new Response(stream, {
-    status: 200,
-    headers: {
-      "Content-Type": "text/event-stream; charset=utf-8",
-      "Cache-Control": "no-cache, no-transform",
-      Connection: "keep-alive",
-      ...corsHeaders(req),
-    },
-  });
-}
-
-/* -------------------- Context helpers -------------------- */
-
-function normalizeContext(ctx = {}) {
-  const c = typeof ctx === "object" && ctx ? structuredClone(ctx) : {};
-  c.destination = c.destination || {};
-  if (c.activities && !Array.isArray(c.activities)) {
-    c.activities = String(c.activities)
-      .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean);
-  }
-  ensureKeys(c, ["durationDays", "startDate", "endDate", "month", "preferences"]);
-  ensureKeys(c.destination, ["country", "region"]);
-  c.activities = Array.isArray(c.activities) ? c.activities : [];
-  return c;
-}
-function ensureKeys(o, keys) { for (const k of keys) if (!(k in o)) o[k] = null; }
-
-function missingSlots(ctx) {
-  const missing = [];
-  if (!ctx?.destination?.country) missing.push("destination.country");
-  if (!ctx?.durationDays || ctx.durationDays < 1) missing.push("durationDays");
-  if (!ctx?.month && !(ctx?.startDate && ctx?.endDate)) missing.push("period");
-  return missing;
-}
-
-function buildPromptFromContext(ctx) {
-  const where = [ctx?.destination?.country, ctx?.destination?.region].filter(Boolean).join(" - ") || "?";
-  const when = ctx?.month ? `in ${ctx.month}` : `${ctx?.startDate || "?"} t/m ${ctx?.endDate || "?"}`;
-  const acts =
-    Array.isArray(ctx?.activities) && ctx.activities.length
-      ? ` Activiteiten: ${ctx.activities.join(", ")}.`
-      : "";
-  const days = ctx?.durationDays || "?";
-  return `Maak een backpack paklijst voor ${days} dagen naar ${where}, ${when}.${acts}`;
-}
-
-/* -------------------- Hybride slot-extractie -------------------- */
-
-async function extractSlots({ utterance, context }) {
-  // 1) Regex baseline (werkt zonder API-key)
-  const m = (utterance || "").toLowerCase().normalize("NFKD").replace(/[\u0300-\u036f]/g, "");
-  const baseline = {
-    context: {
-      durationDays: null,
-      destination: { country: null, region: null },
-      startDate: null,
-      endDate: null,
-      month: null,
-      activities: [],
-      preferences: null,
-    },
-  };
-
-  // Landen
-  const COUNTRY = [
-    { re: /\bvietnam\b/,                 name: "Vietnam" },
-    { re: /\bindonesie|indonesia\b/,     name: "Indonesië" },
-    { re: /\bthailand\b/,                name: "Thailand" },
-    { re: /\bmaleisie|malaysia\b/,       name: "Maleisië" },
-    { re: /\bfilipijnen|philippines\b/,  name: "Filipijnen" },
-    { re: /\blaos\b/,                    name: "Laos" },
-    { re: /\bcambodja|cambodia\b/,       name: "Cambodja" },
-  ];
-  const hit = COUNTRY.find(c => c.re.test(m));
-  if (hit) baseline.context.destination.country = hit.name;
-
-  // Maand
-  const MONTH = /(januari|februari|maart|april|mei|juni|juli|augustus|september|oktober|november|december)/;
-  const mm = m.match(MONTH);
-  if (mm) baseline.context.month = mm[1];
-
-  // Duur
-  const dDays = m.match(/(\d{1,3})\s*(dagen|dag|dgn|d)\b/);
-  const dWks  = m.match(/(\d{1,2})\s*(weken|wk|w)\b/);
-  if (dDays) baseline.context.durationDays = Number(dDays[1]);
-  else if (dWks) baseline.context.durationDays = Number(dWks[1]) * 7;
-
-  // Datumbereik (optioneel)
-  const dateRange = m.match(/(\d{1,2})[-\/.](\d{1,2})[-\/.](\d{2,4}).{0,30}?(\d{1,2})[-\/.](\d{1,2})[-\/.](\d{2,4})/);
-  if (dateRange) {
-    const [, d1, mo1, y1, d2, mo2, y2] = dateRange;
-    baseline.context.startDate = toISO(y1, mo1, d1);
-    baseline.context.endDate   = toISO(y2, mo2, d2);
-  }
-
-  // Activiteiten
-  const acts = [];
-  if (/(duik|duiken|snorkel|scuba)/.test(m)) acts.push("duiken");
-  if (/(hike|hiken|trek|wandelen)/.test(m)) acts.push("hiken");
-  if (/(surf|surfen)/.test(m)) acts.push("surfen");
-  if (/(city|stad|citytrip)/.test(m)) acts.push("citytrip");
-  if (acts.length) baseline.context.activities = acts;
-
-  // 2) Optioneel: LLM-verrijking
-  if (process.env.OPENAI_API_KEY) {
-    try {
-      const schema = { type: "object", properties: { context: { type: "object" } }, required: ["context"], additionalProperties: true };
-      const sys = "Verrijk onderstaande context met expliciet genoemde feiten. Geef ALLEEN JSON.";
-      const user = `Huidige context: ${JSON.stringify(context)}\nZin: "${utterance}"\nVoeg genoemde velden toe; onbekend blijft null.`;
-      const llm = await chatJSON(sys, user, schema);
-      mergeInto(baseline, llm);
-    } catch {}
-  }
-
-  return baseline;
-}
-
-function toISO(y, m, d) {
-  const year = (+y < 100 ? 2000 + (+y) : +y);
-  const month = String(+m).padStart(2, "0");
-  const day = String(+d).padStart(2, "0");
-  return `${year}-${month}-${day}`;
-}
-
-function mergeInto(target, src) {
-  if (!src || typeof src !== "object") return;
-  for (const k of Object.keys(src)) {
-    const v = src[k];
-    if (v && typeof v === "object" && !Array.isArray(v)) {
-      if (!target[k] || typeof target[k] !== "object") target[k] = {};
-      mergeInto(target[k], v);
-    } else if (v !== undefined && v !== null) {
-      target[k] = v;
-    }
-  }
-}
-
-/* -------------------- Vervolgvraag (deterministisch) -------------------- */
-
-function followupQuestion({ missing, context }) {
-  const labels = [];
-  if (missing.includes("destination.country")) labels.push("bestemming (land, optioneel regio)");
-  if (missing.includes("durationDays")) labels.push("hoeveel dagen");
-  if (missing.includes("period")) labels.push("in welke periode (maand of exacte data)");
-  const pref = [];
-  if (context?.destination?.country) pref.push(`bestemming: ${context.destination.country}`);
-  if (context?.durationDays) pref.push(`duur: ${context.durationDays} dagen`);
-  if (context?.month) pref.push(`maand: ${context.month}`);
-  if (context?.startDate && context?.endDate) pref.push(`data: ${context.startDate} t/m ${context.endDate}`);
-  const hint = pref.length ? ` (bekend: ${pref.join(", ")})` : "";
-  return `Kun je nog aangeven: ${labels.join(", " )}?${hint}`;
-}
-
-/* -------------------- Afgeleide context (LLM) -------------------- */
-
-async function derivedContext(ctx) {
-  const sys =
-    "Bepaal, indien mogelijk, het seizoen (winter/lente/zomer/herfst of tropisch nat/droog) op basis van land/maand of data. Kort antwoord, alleen het veld 'season'. Geef JSON.";
-  const user = `Context: ${JSON.stringify(ctx)}.`;
-  const schema = { type: "object", properties: { season: { type: ["string", "null"] } }, required: ["season"] };
-  const json = await chatJSON(sys, user, schema);
-  return json;
-}
-
-/* -------------------- Seasons CSV integratie -------------------- */
-const SEASONS_CSV_URL = (process.env.SEASONS_CSV_URL || "").trim();
-const SEASONS_TTL_MS = 6 * 60 * 60 * 1000; // 6 uur
-const MONTHS_EN = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
-const NL2EN = {
-  januari:"Jan", februari:"Feb", maart:"Mar", april:"Apr", mei:"May", juni:"Jun",
-  juli:"Jul", augustus:"Aug", september:"Sep", oktober:"Oct", november:"Nov", december:"Dec"
-};
-let __SEASONS_CACHE__ = { rows: null, at: 0 };
-
-async function seasonsContextFor(ctx) {
-  try {
-    const tbl = await loadSeasonsTable();
-    if (!tbl || !tbl.length) return {};
-    const out = computeSeasonInfoForContext(ctx, tbl);
-    return out || {};
-  } catch {
-    return {};
-  }
-}
-
-async function loadSeasonsTable() {
-  if (!SEASONS_CSV_URL) return [];
-  if (__SEASONS_CACHE__.rows && Date.now() - __SEASONS_CACHE__.at < SEASONS_TTL_MS) {
-    return __SEASONS_CACHE__.rows;
-  }
-  const res = await fetch(SEASONS_CSV_URL, { cache: "no-store" });
-  if (!res.ok) return [];
-  const text = await res.text();
-  const rows = parseCsv(text);
-  __SEASONS_CACHE__ = { rows, at: Date.now() };
-  return rows;
-}
-
-function monthAbbrevFromContext(ctx) {
-  if (ctx?.month) {
-    const m = String(ctx.month).toLowerCase().trim();
-    return NL2EN[m] || MONTHS_EN.find(mm => mm.toLowerCase().startsWith(m.slice(0,3))) || null;
-  }
-  if (ctx?.startDate) {
-    try {
-      const d = new Date(ctx.startDate);
-      return MONTHS_EN[d.getUTCMonth()];
-    } catch {}
-  }
-  return null;
-}
-
-function normStr(s) {
-  return String(s || "")
-    .normalize("NFKD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .toLowerCase()
-    .trim();
-}
-
-function inSeasonEN(monthAbbrev, start, end) {
-  if (!monthAbbrev || !start || !end) return false;
-  const idx = (m) => MONTHS_EN.indexOf(m) + 1;
-  const m = idx(monthAbbrev), a = idx(start), b = idx(end);
-  if (!m || !a || !b) return false;
-  return a <= b ? (m >= a && m <= b) : (m >= a || m <= b);
-}
-
-function computeSeasonInfoForContext(ctx, table) {
-  const country = ctx?.destination?.country;
-  const region = ctx?.destination?.region;
-  const monthAbbrev = monthAbbrevFromContext(ctx);
-  if (!country || !monthAbbrev) return null;
-
-  const C = normStr(country);
-  const R = normStr(region);
-
-  const hits = table.filter((r) => {
-    const rc = normStr(r.country);
-    const rr = normStr(r.region);
-    const regionMatch = rr ? (rc === C && rr === R) : (rc === C);
-    return regionMatch && inSeasonEN(monthAbbrev, r.start_month, r.end_month);
-  });
-
-  const climate = hits.find(h => String(h.type).toLowerCase() === "climate")?.label || null;
-
-  const risks = hits
-    .filter(h => String(h.type).toLowerCase() === "risk")
-    .map(h => ({
-      type: String(h.label || "").toLowerCase(),
-      level: String(h.level || "unknown").toLowerCase(),
-      note: h.note || ""
-    }));
-
-  const flags = {};
-  const items = new Set();
-  for (const h of hits) {
-    String(h.advice_flags || "")
-      .split(",")
-      .map(s => s.trim())
-      .filter(Boolean)
-      .forEach(f => flags[f] = true);
-    String(h.item_tags || "")
-      .split(",")
-      .map(s => s.trim())
-      .filter(Boolean)
-      .forEach(t => items.add(t));
-  }
-
-  return { season: climate, seasonalRisks: risks, adviceFlags: flags, itemTags: Array.from(items) };
-}
-
-/* -------------------- Prompt-injectie seizoenscontext -------------------- */
-
-function seasonPromptLines(seasonsCtx) {
-  const bits = [];
-  if (seasonsCtx?.season) {
-    bits.push(`Seizoenscontext: ${seasonsCtx.season}.`);
-  }
-  if (Array.isArray(seasonsCtx?.seasonalRisks) && seasonsCtx.seasonalRisks.length) {
-    const top = seasonsCtx.seasonalRisks[0];
-    const lvl = top.level ? ` (${top.level})` : "";
-    bits.push(`Belangrijke risico's: ${top.type}${lvl}.`);
-  }
-  if (!bits.length) return [];
-  return [
-    {
-      role: "system",
-      content:
-        `Gebruik deze seizoenscontext expliciet in de adviezen en paklijst (kleding/gear/health/tips). ` +
-        bits.join(" "),
-    },
-  ];
-}
-
-/* -------------------- Generate & Stream -------------------- */
-
-async function generateAndStream({ controller, send, req, prompt, context, history, lastUserMessage, nluHints }) {
-  const derived = await derivedContext(context);
-  const seasonsCtx = await seasonsContextFor(context);
-
-  send("context", { ...derived, ...seasonsCtx });
-
-  const systemExtras = seasonPromptLines(seasonsCtx);
-
-  send("start", {});
-  try {
-    const messages = buildMessagesForOpenAI({
-      systemExtras,
-      prompt,
-      history,
-      contextSummary: summarizeContext(context),
-      lastUserMessage,
-      nluHints, // <— meegeven
-    });
-
-    await streamOpenAI({
-      messages,
-      onDelta: (chunk) => send("delta", chunk),
-    });
-  } catch (e) {
-    send("error", { message: e?.message || "Fout bij genereren" });
-    controller.close();
-    return;
-  }
-
-  try {
-    const products = await productsFromCSV(context, req);
-    if (Array.isArray(products) && products.length) {
-      const batch = 6;
-      for (let i = 0; i < Math.min(products.length, 24); i += batch) {
-        send("products", products.slice(i, i + batch));
-      }
-    }
-  } catch (e) {
-    send("products", [{
-      category: "DEBUG",
-      name: `products error: ${(e && e.message) || "unknown"}`,
-      weight_grams: null,
-      activities: "",
-      seasons: "",
-      url: "",
-      image: ""
-    }]);
-  }
-
-  send("context", { ...derived, ...seasonsCtx });
-  send("done", {});
-  controller.close();
-}
-
-/* ---------- Context samenvatting (inject als system) ---------- */
-function summarizeContext(ctx) {
-  const parts = [];
-  if (ctx?.destination?.country) parts.push(`land: ${ctx.destination.country}`);
-  if (ctx?.destination?.region) parts.push(`regio: ${ctx.destination.region}`);
-  if (ctx?.durationDays) parts.push(`duur: ${ctx.durationDays} dagen`);
-  if (ctx?.month) parts.push(`maand: ${ctx.month}`);
-  if (ctx?.startDate && ctx?.endDate) parts.push(`data: ${ctx.startDate} t/m ${ctx.endDate}`);
-  if (Array.isArray(ctx?.activities) && ctx.activities.length) parts.push(`activiteiten: ${ctx.activities.join(", ")}`);
-  if (!parts.length) return null;
-  return `Bekende context (${parts.join(" • ")}). Gebruik dit impliciet bij je advies als het relevant is.`;
-}
-
-/* ---------- Bouw OpenAI messages ---------- */
-function buildMessagesForOpenAI({ systemExtras = [], prompt, history, contextSummary, lastUserMessage, nluHints }) {
-  const baseSystem = {
-    role: "system",
-    content:
-      "Je schrijft compacte, praktische paklijsten in het Nederlands. Gebruik secties: Korte samenvatting, Kleding, Gear, Gadgets, Health, Tips. Geen disclaimers.",
-  };
-
-  const approxSystem = (nluHints?.policy?.allowApproximate || nluHints?.durationPhrase || nluHints?.periodPhrase)
-    ? [{
-        role: "system",
-        content:
-          "Je mag vage tijdsaanduidingen taalkundig interpreteren. Voorbeelden: 'paar maanden' ≈ 2–3 maanden (neem 3 bij twijfel), 'rond de jaarwisseling' ≈ 20 dec–10 jan. " +
-          "Als er voldoende signaal is in de laatste userboodschap of history, vul ontbrekende velden in zonder opnieuw te vragen; vraag alleen door bij echte ambiguïteit.",
-      }]
-    : [];
-
-  const extras = (systemExtras || []).map((m) => ({ role: "system", content: m.content || m }));
-  const ctxMsg = contextSummary ? [{ role: "system", content: contextSummary }] : [];
-
-  if (history && history.length) {
-    const hist = history.map((m) => ({ role: m.role, content: String(m.content || "").slice(0, 8000) }));
-    const tail = lastUserMessage ? [{ role: "user", content: String(lastUserMessage).slice(0, 8000) }] : [];
-    return [...approxSystem, ...extras, baseSystem, ...ctxMsg, ...hist, ...tail];
-  }
-
-  return [...approxSystem, ...extras, baseSystem, ...ctxMsg, { role: "user", content: prompt }];
-}
-
-/* -------------------- CSV producten -------------------- */
-const CSV_PUBLIC_PATH = "/pack_products.csv"; // fallback-pad
-
-function resolveCsvUrl(origin) {
-  const url = (process.env.PRODUCTS_CSV_URL && String(process.env.PRODUCTS_CSV_URL).trim()) || "";
-  return url || new URL(CSV_PUBLIC_PATH, origin).toString();
-}
-
-function getCsvCache() {
-  if (!globalThis.__PACKLIST_CSV__) {
-    globalThis.__PACKLIST_CSV__ = { rows: null, at: 0 };
-  }
-  return globalThis.__PACKLIST_CSV__;
-}
-
-async function productsFromCSV(ctx, req) {
-  const origin = new URL(req.url).origin;
-  const resolvedUrl = resolveCsvUrl(origin);
-
-  let rows;
-  try {
-    rows = await loadCsvOnce(origin);
-  } catch (e) {
-    return [{
-      category: "DEBUG",
-      name: `CSV load error: ${(e && e.message) || "unknown"}`,
-      weight_grams: null,
-      activities: "",
-      seasons: "",
-      url: resolvedUrl,
-      image: ""
-    }];
-  }
-
-  const acts  = (ctx?.activities || []).map((s) => String(s).toLowerCase());
-  const month = (ctx?.month || "").toLowerCase();
-
-  let seasonHint = "";
-  if (["december","januari","februari"].includes(month)) seasonHint = "winter";
-  else if (["juni","juli","augustus"].includes(month))   seasonHint = "zomer";
-
-  const filtered = rows.filter((r) => {
-    const prodActs    = splitCsvList(r.activities);
-    const prodSeasons = splitCsvList(r.seasons);
-
-    const actsOk =
-      prodActs.length === 0 ||
-      acts.some((a) => prodActs.includes(a));
-
-    const seasonOk =
-      prodSeasons.length === 0 ||
-      prodSeasons.includes("alle") ||
-      (seasonHint && prodSeasons.includes(seasonHint)) ||
-      (month && prodSeasons.includes(month));
-
-    return actsOk && seasonOk;
-  });
-
-  let outRows = filtered;
-  if (outRows.length === 0) {
-    outRows = rows.filter((r) => {
-      const a = splitCsvList(r.activities).length === 0;
-      const s = splitCsvList(r.seasons);
-      return a && (s.length === 0 || s.includes("alle"));
-    });
-  }
-
-  const debugItem = {
-    category: "DEBUG",
-    name: `csv=${resolvedUrl} | total=${rows.length} | filtered=${filtered.length} | out=${outRows.length}`,
-    weight_grams: null,
-    activities: acts.join(","),
-    seasons: seasonHint || month || "",
-    url: resolvedUrl,
-    image: ""
-  };
-
-  const mapped = outRows.map(mapCsvRow);
-  const dedup  = dedupeBy(mapped, (p) => `${p.category}|${p.name}`).slice(0, 24);
-  return [debugItem, ...dedup];
-}
-
-function splitCsvList(v) {
-  if (!v) return [];
-  return String(v)
-    .split(/[,;]+/)
-    .map((s) => s.trim().toLowerCase())
-    .filter(Boolean);
-}
-
-function mapCsvRow(r) {
-  return {
-    category: r.category || "",
-    name: r.name || "",
-    weight_grams: r.weight_grams ? Number(String(r.weight_grams).replace(",", ".")) : null,
-    activities: r.activities || "",
-    seasons: r.seasons || "",
-    url: r.url || "",
-    image: r.image || "",
-  };
-}
-
-function dedupeBy(arr, keyFn) {
-  const seen = new Set();
-  const out = [];
-  for (const x of arr) {
-    const k = keyFn(x);
-    if (!seen.has(k)) { seen.add(k); out.push(x); }
-  }
-  return out;
-}
-
-async function loadCsvOnce(origin) {
-  const cache = getCsvCache();
-  if (cache.rows && Date.now() - cache.at < 1000 * 60 * 10) {
-    return cache.rows; // 10 min cache
-  }
-
-  const url = resolveCsvUrl(origin);
-  const res = await fetch(url, { cache: "no-store" });
-  if (!res.ok) throw new Error(`CSV fetch failed ${res.status} @ ${url}`);
-
-  const text = await res.text();
-  const rows = parseCsv(text);
-  if (!Array.isArray(rows) || rows.length === 0) {
-    throw new Error(`CSV parsed empty @ ${url}`);
-  }
-
-  cache.rows = rows;
-  cache.at = Date.now();
-  return rows;
-}
-
-function parseCsv(text) {
-  const lines = text.replace(/\r\n?/g, "\n").split("\n").filter((l) => l.trim().length);
-  if (lines.length === 0) return [];
-  const headers = splitCsvLine(lines[0]).map((h) => h.trim());
-  const out = [];
-  for (let i = 1; i < lines.length; i++) {
-    const cells = splitCsvLine(lines[i]);
-    const row = {};
-    headers.forEach((h, idx) => (row[h] = cells[idx] ?? ""));
-    if ("weight" in row && !("weight_grams" in row)) row.weight_grams = row.weight;
-    out.push(row);
-  }
-  return out;
-}
-
-function splitCsvLine(line) {
-  const out = [];
-  let cur = "";
-  let inQ = false;
-  for (let i = 0; i < line.length; i++) {
-    const ch = line[i];
-    if (inQ) {
-      if (ch === '"' && line[i + 1] === '"') { cur += '"'; i++; }
-      else if (ch === '"') { inQ = false; }
-      else { cur += ch; }
-    } else {
-      if (ch === '"') { inQ = true; }
-      else if (ch === ",") { out.push(cur); cur = ""; }
-      else { cur += ch; }
-    }
-  }
-  out.push(cur);
-  return out.map((s) => s.trim());
-}
-
-/* -------------------- OpenAI helpers -------------------- */
-
-function sanitizeHistory(raw) {
-  if (!Array.isArray(raw)) return null;
-  const ok = [];
-  for (const m of raw) {
-    const role = (m && m.role) || "";
-    const content = (m && m.content) || "";
-    if (!content) continue;
-    if (role !== "user" && role !== "assistant") continue;
-    ok.push({ role, content: String(content).slice(0, 8000) });
-    if (ok.length >= 24) break;
-  }
-  return ok.length ? ok : null;
-}
-
-async function chatJSON(system, user, jsonSchema) {
-  let res = await fetch(`${OPENAI_API_BASE}/chat/completions`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-    },
-    body: JSON.stringify({
-      model: OPENAI_MODEL_JSON,
-      messages: [
-        { role: "system", content: system },
-        { role: "user", content: user },
-      ],
-      temperature: 0,
-      response_format: { type: "json_schema", json_schema: { name: "extraction", schema: jsonSchema, strict: true } },
-    }),
-  });
-
-  if (!res.ok && res.status === 400) {
-    res = await fetch(`${OPENAI_API_BASE}/chat/completions`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-      },
-      body: JSON.stringify({
-        model: OPENAI_MODEL_JSON,
-        messages: [
-          { role: "system", content: "Geef ALLEEN geldige JSON terug, zonder tekst of uitleg." },
-          { role: "user", content: `${system}\n\n${user}\n\nAntwoord uitsluitend met JSON.` },
-        ],
-        temperature: 0,
-        response_format: { type: "json_object" },
-      }),
-    });
-  }
-
-  if (!res.ok) {
-    const err = await safeErrorText(res);
-    throw new Error(`OpenAI json error: ${res.status}${err ? ` — ${err}` : ""}`);
-  }
-
-  const j = await res.json();
-  const txt = j?.choices?.[0]?.message?.content || "{}";
-  try { return JSON.parse(txt); } catch { return {}; }
-}
-
-async function safeErrorText(res) {
-  try { return (await res.text())?.slice(0, 400); } catch { return ""; }
-}
-
-async function streamOpenAI({ messages, onDelta }) {
-  if (!Array.isArray(messages) || messages.length === 0) {
-    throw new Error("Missing messages for OpenAI");
-  }
-
-  const res = await fetch(`${OPENAI_API_BASE}/chat/completions`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-    },
-    body: JSON.stringify({
-      model: OPENAI_MODEL_TEXT,
-      stream: true,
-      temperature: 0.4,
-      messages,
-    }),
-  });
-  if (!res.ok || !res.body) throw new Error(`OpenAI stream error: ${res.status}`);
-
-  const reader = res.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-
+/* ---------- SSE helper ---------- */
+async function* sseLines(reader: ReadableStreamDefaultReader<Uint8Array>) {
+  const decoder = new TextDecoder("utf-8")
+  let buffer = ""
   while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-
-    const parts = buffer.split("\n\n");
-    for (let i = 0; i < parts.length - 1; i++) {
-      const block = parts[i];
-      const line = block.split("\n").find((l) => l.startsWith("data: "));
-      if (!line) continue;
-      const data = line.slice(6).trim();
-      if (data === "[DONE]") return;
-      try {
-        const json = JSON.parse(data);
-        const delta = json?.choices?.[0]?.delta?.content;
-        if (delta) onDelta(delta);
-      } catch {}
+    const { value, done } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true })
+    let idx: number
+    while ((idx = buffer.indexOf("\n\n")) >= 0) {
+      const raw = buffer.slice(0, idx).trimEnd()
+      buffer = buffer.slice(idx + 2)
+      if (raw.length) yield raw
     }
-    buffer = parts[parts.length - 1];
   }
+  if (buffer.trim().length) yield buffer
 }
+
+/* ---------- Formatter helpers ---------- */
+function escapeHtml(s: string) {
+  return s.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;")
+}
+function inlineMd(s: string) {
+  let out = s
+  out = out.replace(/`([^`]+)`/g, (_m, c) => `<code class="ai-inline-code">${escapeHtml(c)}</code>`)
+  out = out.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+  out = out.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, (_m, t, u) => `<a href="${u}" target="_blank" rel="noreferrer">${escapeHtml(t)}</a>`)
+  out = out.replace(/(^|[^*])\*([^*]+)\*(?!\*)/g, (_m, pre, txt) => `${pre}<em>${txt}</em>`)
+  return out
+}
+function normalizeLLMText(raw: string): string {
+  if (!raw) return ""
+  return raw.replace(/\r\n/g, "\n").replace(/\n{3,}/g, "\n\n").replace(/[ \t]+/g, " ").trim()
+}
+function beautifySummary(text: string): string {
+  const re =
+    /(?:^|\n)\s*(?:[-*]\s*)?(?:\*\*)?\s*Korte\s*samenvatting\s*(?:\*\*)?\s*[:：]?\s*\n?([\s\S]*?)(?=\n\s*(?:\*\*(?:Kleding|Gear|Gadgets|Health|Tips)\*\*|(?:Kleding|Gear|Gadgets|Health|Tips)\s*[-:]|#{1,6}\s|\n{2,}|$))/i
+  const m = text.match(re)
+  if (!m) return text
+  let body = (m[1] || "").trim()
+  const hasBullets = /^[-*]\s+/m.test(body)
+  let bullets: string[]
+  if (hasBullets) {
+    bullets = body.split(/\n/).map((s) => s.replace(/^\s*[-*]\s*/, "").trim()).filter(Boolean)
+  } else {
+    body = body.replace(/\s[-–—]\s/g, ". ")
+    bullets = body.replace(/([.!?])\s+(?=[A-ZÀ-Ý0-9])/g, "$1\n").split(/\n|•/).map((s) => s.trim()).filter(Boolean)
+  }
+  bullets = bullets.slice(0, 5)
+  if (!bullets.length) return text
+  const pretty = `**Korte samenvatting**\n\n${bullets.map((b) => `- ${b}`).join("\n")}\n\n`
+  return text.replace(re, `\n${pretty}`)
+}
+function structureSections(text: string): string {
+  const sections = ["Kleding", "Gear", "Gadgets", "Health", "Tips"]
+  let out = text
+  for (const sec of sections) {
+    const titleRe = new RegExp(String.raw`(^|\n)\s*(?:\*\*)?\s*${sec}\s*(?:\*\*)?\s*[-:]\s*`, "gi")
+    out = out.replace(titleRe, (_m, pre) => `${pre}**${sec}**\n`)
+  }
+  for (const sec of sections) {
+    const blockRe = new RegExp(String.raw`\*\*${sec}\*\*[\s\S]*?(?=\n\*\*(?:${sections.join("|")})\*\*|\n{2,}|$)`, "g")
+    out = out.replace(blockRe, (block) => {
+      let b = block
+      if (!/^[-*]\s+/m.test(b) && /\s[-–—]\s/.test(b)) {
+        b = b.replace(new RegExp(String.raw`\*\*${sec}\*\*\s*`), ($1) => `${$1}- `)
+        b = b.replace(/\s[-–—]\s/g, "\n- ")
+      }
+      b = b.replace(new RegExp(String.raw`(\*\*${sec}\*\*)(?!\s*\n)`), "$1\n")
+      return b
+    })
+  }
+  return out
+}
+function extractSummaryMarkdown(normalized: string): string {
+  const m = normalized.match(/(\*\*Korte\s*samenvatting\*\*[\s\S]*?)(?=\s*\*\*(?:Kleding|Gear|Gadgets|Health|Tips)\*\*|\n{2,}|$)/i)
+  if (m) return m[1].trim()
+  const sectionRe = /\*\*(Kleding|Gear|Gadgets|Health|Tips)\*\*/i
+  const sec = sectionRe.exec(normalized)
+  if (sec && sec.index >= 0) {
+    const head = normalized.slice(0, sec.index).trim()
+    if (head) return head
+  }
+  const firstBreak = normalized.search(/[.!?]\s|\n{2,}|\n/)
+  const sliceEnd = firstBreak > 0 ? firstBreak + 1 : Math.min(280, normalized.length)
+  return normalized.slice(0, sliceEnd).trim()
+}
+function formatToChatUI(raw: string, opts?: { summaryOnly?: boolean }): string {
+  if (!raw) return ""
+  const normalized = structureSections(beautifySummary(normalizeLLMText(raw)))
+  const source = opts?.summaryOnly ? extractSummaryMarkdown(normalized) : normalized
+  const lines = source.split("\n")
+  const out: string[] = []
+  let inCode = false
+  let codeLang = ""
+  let codeBuf: string[] = []
+  let listType: "ul" | "ol" | null = null
+  const flushList = () => { if (listType) { out.push(`</${listType}>`); listType = null } }
+  const startList = (type: "ul" | "ol") => { if (listType !== type) { flushList(); listType = type; out.push(`<${type} class="ai-list">`) } }
+  const flushCode = () => {
+    if (!inCode) return
+    const codeHtml = escapeHtml(codeBuf.join("\n"))
+    const langClass = codeLang ? ` language-${codeLang}` : ""
+    out.push(`<div class="ai-codeblock"><pre class="ai-pre"><code class="ai-code${langClass}">${codeHtml}</code></pre></div>`)
+    inCode = false; codeLang = ""; codeBuf = []
+  }
+  for (const lineRaw of lines) {
+    const line = lineRaw
+    const fence = line.match(/^```(\w+)?\s*$/)
+    if (fence) { if (!inCode) { flushList(); inCode = true; codeLang = fence[1] || ""; codeBuf = [] } else { flushCode() } continue }
+    if (inCode) { codeBuf.push(line); continue }
+    if (!line.trim()) { flushList(); continue }
+    const h = line.match(/^(#{1,6})\s+(.*)$/)
+    if (h) { flushList(); out.push(`<p class="ai-heading">${inlineMd(h[2].trim())}</p>`); continue }
+    const bq = line.match(/^>\s?(.*)$/)
+    if (bq) { flushList(); out.push(`<blockquote class="ai-quote">${inlineMd(bq[1])}</blockquote>`); continue }
+    if (/^\s*\d+\.\s+/.test(line)) { startList("ol"); out.push(`<li>${inlineMd(line.replace(/^\s*\d+\.\s+/, ""))}</li>`); continue }
+    if (/^\s*[-*]\s+/.test(line)) { startList("ul"); out.push(`<li>${inlineMd(line.replace(/^\s*[-*]\s+/, ""))}</li>`); continue }
+    if (/^\s*---+\s*$/.test(line)) { flushList(); out.push(`<hr class="ai-hr" />`); continue }
+    flushList(); out.push(`<p>${inlineMd(line.trim())}</p>`)
+  }
+  flushList(); flushCode()
+  return `
+<style>
+  .ai-rich { font-size: 15px; line-height: 1.75; }
+  .ai-rich p { margin: 10px 0; }
+  .ai-rich .ai-heading { font-weight: 600; margin: 14px 0 6px; }
+  .ai-rich .ai-list { padding-left: 22px; margin: 8px 0; }
+  .ai-rich .ai-list li { margin: 6px 0; }
+  .ai-rich .ai-quote { border-left: 3px solid rgba(0,0,0,.12); margin: 12px 0; padding: 6px 12px; background: rgba(0,0,0,.03); border-radius: 8px; }
+  .ai-rich code.ai-inline-code { font-family: ui-monospace,Menlo,Consolas,monospace; font-size: .92em; padding: 1px 6px; border-radius: 6px; background: rgba(15,23,42,.06); }
+  .ai-rich .ai-codeblock { border: 1px solid rgba(0,0,0,.08); border-radius: 12px; overflow: hidden; margin: 12px 0; }
+  .ai-rich .ai-pre { margin:0; padding:10px; background: rgba(15,23,42,.03); overflow:auto; }
+  .ai-rich .ai-code { font-family: ui-monospace,Menlo,Consolas,monospace; font-size: 12.8px; white-space: pre; }
+  .ai-rich .ai-hr { border:none; border-top:1px solid rgba(0,0,0,.08); margin: 14px 0; }
+  .ai-rich a { text-decoration: underline; text-underline-offset: 3px; }
+</style>
+<div class="ai-rich">${out.join("")}</div>`
+}
+
+/* ---------- Helpers ---------- */
+function deepMerge<T>(target: T, source: any): T {
+  if (source === null || typeof source !== "object") return target
+  const out: any = Array.isArray(target) ? [...(target as any)] : { ...(target as any) }
+  for (const k of Object.keys(source)) {
+    const sv = (source as any)[k]
+    const tv = (out as any)[k]
+    if (sv && typeof sv === "object" && !Array.isArray(sv)) { (out as any)[k] = deepMerge(tv ?? {}, sv) }
+    else if (sv !== null && sv !== undefined) { (out as any)[k] = sv }
+  }
+  return out
+}
+function simplifyAskQuestion(q: string): string {
+  if (!q) return q
+  let t = q.replace(/\s*\((?:bekend|known)\s*:[^)]+\)\s*/gi, " ")
+  t = t.replace(/\s{2,}/g, " ").replace(/\s+\?/g, "?").trim()
+  return t
+}
+function isBlockedProduct(p: Product): boolean {
+  const u = (p.url || "").toLowerCase()
+  if (!u) return false
+  return (
+    /\.csv(\?|$)/.test(u) ||
+    u.includes("export=download&format=csv") ||
+    u.includes("docs.google.com/spreadsheets") ||
+    (u.includes("sheet") && u.includes("gid=")) ||
+    /debug|dbg|test/.test((p.name || "").toLowerCase())
+  )
+}
+function dedupeProducts(list: ProductsEvent): ProductsEvent {
+  const seen = new Set<string>()
+  const out: ProductsEvent = []
+  for (const p of list) { if (isBlockedProduct(p)) continue; const key = `${p.name ?? ""}|${p.url ?? ""}`.toLowerCase(); if (!seen.has(key)) { seen.add(key); out.push(p) } }
+  return out
+}
+
+/* ---------- Lichte NLU ---------- */
+type NLUHints = {
+  lang: "nl" | "en"
+  country?: string | null
+  durationDays?: number | null
+  startDate?: string | null
+  endDate?: string | null
+  month?: string | null
+  confidence: number
+  paraphrase?: string
+}
+const strip = (s = "") => s.normalize("NFD").replace(/\p{Diacritic}+/gu, "").toLowerCase()
+const COUNTRY_LIST =
+  "vietnam|filipijnen|indonesie|indonesië|thailand|cambodja|laos|spanje|portugal|italie|italië|frankrijk|griekenland|turkije|marokko|mexico|peru|argentinie|argentinë|chili|japan|korea|australie|australië|nieuw-zeeland|canada|verenigde staten|vs|noorwegen|zweden|finland".split("|")
+const MONTHS: Record<string, number> = {
+  januari: 0, februari: 1, maart: 2, april: 3, mei: 4, juni: 5, juli: 6, augustus: 7, september: 8, oktober: 9, november: 10, december: 11,
+  january: 0, february: 1, march: 2, april: 3, may: 4, june: 5, july: 6, august: 7, september: 8, october: 9, november: 10, december: 11,
+}
+function iso(d: Date) { const z = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate())); return z.toISOString().slice(0,10) }
+function parseFlexibleDuration(t: string): number | null {
+  const s = strip(t)
+  const m = s.match(/\b(\d{1,3})\s*(dagen|dag|weken|week|maanden|maand|d|w|m)\b/i)
+  if (m) { const n = parseInt(m[1], 10); const u = m[2][0].toLowerCase(); return u==="w"?n*7:u==="m"?n*30:n }
+  if (/\b(paar|enkele)\s*maanden?\b/.test(s)) return 90
+  if (/\b(maandje)\b/.test(s)) return 30
+  if (/\b(weekje)\b/.test(s)) return 7
+  if (/\b(paar|enkele)\s*weken?\b/.test(s)) return 14
+  return null
+}
+function parseFlexiblePeriod(t: string): { month?: string | null; startDate?: string | null; endDate?: string | null } {
+  const s = strip(t)
+  const range = s.match(/\b(\d{1,2})\s*(?:-|t\/m|tot)\s*(\d{1,2})\s*(januari|februari|maart|april|mei|juni|juli|augustus|september|oktober|november|december)\s*(\d{4})?\b/)
+  if (range) {
+    const d1 = parseInt(range[1],10), d2 = parseInt(range[2],10)
+    const monthTxt = range[3]
+    const mIdx = MONTHS[monthTxt as keyof typeof MONTHS]
+    const y = range[4] ? parseInt(range[4],10) : new Date().getFullYear()
+    return { startDate: iso(new Date(Date.UTC(y,mIdx,d1))), endDate: iso(new Date(Date.UTC(y,mIdx,d2))), month: null }
+  }
+  const vanaf = s.match(/vanaf\s+(\d{1,2})\s+(januari|februari|maart|april|mei|juni|juli|augustus|september|oktober|november|december)/)
+  if (vanaf) { const d = parseInt(vanaf[1],10), mIdx = MONTHS[vanaf[2] as keyof typeof MONTHS], y = new Date().getFullYear(); return { startDate: iso(new Date(Date.UTC(y,mIdx,d))), endDate: null, month: null } }
+  const rel = s.match(/over\s+(\d{1,2})\s*(weken|maanden|dagen)/)
+  if (rel) {
+    const n = parseInt(rel[1],10), unit = rel[2]; const now = new Date(), sd = new Date(now)
+    if (/weken/.test(unit)) sd.setUTCDate(sd.getUTCDate()+n*7)
+    else if (/maanden/.test(unit)) sd.setUTCMonth(sd.getUTCMonth()+n)
+    else sd.setUTCDate(sd.getUTCDate()+n)
+    return { startDate: iso(sd), endDate: null, month: null }
+  }
+  if (/\b(jaarwisseling|kerst)\b/.test(s)) return { month: "december", startDate: null, endDate: null }
+  const m = s.match(/\b(januari|februari|maart|april|mei|juni|juli|augustus|september|oktober|november|december|january|february|march|april|may|june|july|august|september|october|november|december)\b/)
+  if (m) return { month: m[0].toLowerCase(), startDate: null, endDate: null }
+  return { month: null, startDate: null, endDate: null }
+}
+function detectCountry(t: string): string | null {
+  const s = strip(t)
+  const re = new RegExp(`\\b(${COUNTRY_LIST.join("|")})\\b`, "i")
+  return s.match(re)?.[0] ?? null
+}
+function nluHintsFrom(message: string, prev: { destination?: { country?: string | null }, durationDays?: number | null, month?: string | null, startDate?: string | null, endDate?: string | null }): NLUHints {
+  const country = detectCountry(message) ?? prev?.destination?.country ?? null
+  const durationDays = parseFlexibleDuration(message) ?? prev.durationDays ?? null
+  const per = parseFlexiblePeriod(message)
+  const month = per.month ?? prev.month ?? null
+  const startDate = per.startDate ?? prev.startDate ?? null
+  const endDate = per.endDate ?? prev.endDate ?? null
+  let conf = 0; if (country) conf += 0.3; if (durationDays) conf += 0.25; if (month || startDate) conf += 0.25; conf = Math.min(1, conf)
+  const bits: string[] = []
+  if (country) bits.push(`land: ${country}`)
+  if (month) bits.push(`periode: ${month}`); else if (startDate) bits.push(`periode: ${startDate}${endDate ? ` → ${endDate}` : ""}`)
+  if (durationDays) bits.push(`duur: ${durationDays} dagen`)
+  const paraphrase = bits.length ? `Als ik je goed begrijp: ${bits.join(" • ")}.` : undefined
+  return { lang: "nl", country, durationDays, month, startDate, endDate, confidence: conf, paraphrase }
+}
+
+/* ---------- History helpers ---------- */
+function stripHtmlTags(html = "") { return html.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim() }
+function buildHistoryForBackend(msgs: ChatMsg[]): OpenAIHistoryMsg[] {
+  const last = msgs.slice(-12).map((m) => {
+    const raw = (m.text ?? (m.html ? stripHtmlTags(m.html) : "")).trim()
+    return { role: m.role, content: raw.slice(0, 2000) }
+  })
+  return last.filter((m) => m.content && !/^AI is aan het nadenken/i.test(m.content))
+}
+
+/* ---------- Vragen-onderdrukking ---------- */
+const DONT_KNOW_RE = /\b(weet ik (nog )?niet|geen idee|idk|niet zeker|nog onzeker)\b/i
+function classifyAskSlot(q: string): StepId | null {
+  const s = q.toLowerCase()
+  if (/(hoeveel|duur|dagen)/.test(s)) return "duration"
+  if (/(periode|maand|exacte data|wanneer)/.test(s)) return "period"
+  if (/(bestemming|land|regio)/.test(s)) return "countries"
+  if (/(activiteit)/.test(s)) return "activities"
+  return null
+}
+
+/* ---------- Brand-icoon ---------- */
+const BrandIcon: React.FC<{ color?: string }> = ({ color = "currentColor" }) => (
+  <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke={color} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+    <circle cx="12" cy="12" r="9" />
+    <path d="M3 12h18" />
+    <path d="M12 3a15 15 0 0 1 0 18" />
+    <path d="M12 3a15 15 0 0 0 0 18" />
+  </svg>
+)
+
+/* ---------- Component (Chat) ---------- */
+type Props = { showHint?: boolean }
+
+export default function PacklistAssistant({ showHint = true }: Props) {
+  // font
+  React.useEffect(() => {
+    const id = "poppins-font-link"
+    if (!document.getElementById(id)) {
+      const link = document.createElement("link")
+      link.id = id
+      link.rel = "stylesheet"
+      link.href = "https://fonts.googleapis.com/css2?family=Poppins:wght@400;600;700&display=swap"
+      document.head.appendChild(link)
+    }
+  }, [])
+
+  const [darkMode, setDarkMode] = React.useState(false)
+
+  // Conversatie state
+  const [messages, setMessages] = React.useState<ChatMsg[]>([
+    { role: "assistant", text: "Hoi! 👋 Vertel in je eigen woorden je plannen (landen, duur, periode, activiteiten). Ik kan alvast advies geven als nog niet alles bekend is." },
+  ])
+  const [input, setInput] = React.useState("")
+  const [running, setRunning] = React.useState(false)
+  const [thinking, setThinking] = React.useState(false)
+  const [error, setError] = React.useState<string | null>(null)
+
+  // Meta
+  const [seasonHint, setSeasonHint] = React.useState<string | null>(null)
+  const [seasonMeta, setSeasonMeta] = React.useState<{ risks?: SeasonalRisk[]; adviceFlags?: Record<string, boolean> } | null>(null)
+  const [assumptions, setAssumptions] = React.useState<string[]>([]) // optioneel vanuit backend
+
+  const [products, setProducts] = React.useState<Product[]>([])
+  const [selected, setSelected] = React.useState<Record<string, boolean>>({})
+  const abortRef = React.useRef<AbortController | null>(null)
+
+  // Context
+  const [context, setContext] = React.useState<{
+    destination: { country: string | null; region: string | null }
+    durationDays: number | null
+    startDate: string | null
+    endDate: string | null
+    month: string | null
+    activities: string[]
+    preferences: any | null
+  }>({
+    destination: { country: null, region: null },
+    durationDays: null,
+    startDate: null,
+    endDate: null,
+    month: null,
+    activities: [],
+    preferences: null,
+  })
+
+  // Voor onderdrukking van vragen:
+  const [slotsUserDoesNotKnow, setSlotsUserDoesNotKnow] = React.useState<Set<StepId>>(new Set())
+  const askedThisTurnRef = React.useRef<{ seenTexts: Set<string>; perSlot: Record<StepId, number>; total: number }>({
+    seenTexts: new Set(),
+    perSlot: { countries: 0, period: 0, duration: 0, activities: 0 },
+    total: 0,
+  })
+
+  const theme = darkMode ? dark : light
+
+  const pushAssistantText = (t: string) => setMessages((m) => [...m, { role: "assistant", text: t }])
+  const pushAssistantHTML = (h: string) => setMessages((m) => [...m, { role: "assistant", html: h }])
+
+  const productKey = (p: Product, i: number) => `${p.name ?? "item"}|${p.url ?? ""}|${i}`
+  const toggleSelected = (key: string) => setSelected((s) => ({ ...s, [key]: !s[key] }))
+
+  const resetTurnSideEffects = React.useCallback(() => {
+    setError(null); setProducts([]); setSelected({}); setAssumptions([])
+    askedThisTurnRef.current = { seenTexts: new Set(), perSlot: { countries: 0, period: 0, duration: 0, activities: 0 }, total: 0 }
+  }, [])
+
+  const handleStop = React.useCallback(() => {
+    abortRef.current?.abort(); abortRef.current = null; setRunning(false); setThinking(false)
+  }, [])
+
+  function formatSeasonNote(season: string | null | undefined, risks?: SeasonalRisk[]) {
+    if (!season) return null
+    const top = (risks || [])[0]
+    if (top) { const lvl = top.level ? ` (${top.level})` : ""; return `Seizoen: ${season} • Risico: ${top.type}${lvl}` }
+    return `Seizoen: ${season}`
+  }
+
+  /* ---------- Optimistisch updaten ---------- */
+  function extractFromText(t: string) {
+    if (!t) return
+    // LAND
+    const cRx = new RegExp(`\\b(${COUNTRY_LIST.join("|")})\\b`, "i")
+    const country = t.match(cRx)?.[0]
+    if (country) setContext((c) => deepMerge(c, { destination: { country, region: null } }))
+    // DUUR
+    const dur = t.match(/\b(\d{1,3})\s*(dagen|dag|weken|week|maanden|maand|d|w|m)\b/i)
+    if (dur) {
+      const [, nStr, unitRaw] = dur
+      const n = parseInt(nStr, 10)
+      const unit = unitRaw.toLowerCase()
+      const days = unit.startsWith("w") ? n * 7 : unit.startsWith("m") ? n * 30 : n
+      setContext((c) => deepMerge(c, { durationDays: Number.isFinite(days) ? days : null }))
+    }
+    // PERIODE (maand)
+    const month = t.match(/\b(januari|februari|maart|april|mei|juni|juli|augustus|september|oktober|november|december)\b/i)?.[0]
+    if (month) setContext((c) => deepMerge(c, { month: month.toLowerCase() }))
+  }
+
+  /* ---------- Backend trigger (policy + history + nluHints) ---------- */
+  async function sendToBackend(message: string, history?: OpenAIHistoryMsg[], nluHints?: NLUHints) {
+    resetTurnSideEffects()
+    setRunning(true); setThinking(true)
+    try {
+      const ac = new AbortController(); abortRef.current = ac
+      const res = await fetch(`${API_BASE}/api/packlist`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message, context, history, nluHints, policy: DEFAULT_POLICY }),
+        signal: ac.signal,
+      })
+      if (!res.ok || !res.body) throw new Error(`Stream response not OK (${res.status})`)
+
+      let streamedText = ""
+      let hasStarted = false
+
+      const reader = res.body.getReader()
+      for await (const chunk of sseLines(reader)) {
+        let ev: string | null = null
+        let dataRaw = ""
+        for (const line of chunk.split("\n")) {
+          if (line.startsWith("event:")) ev = line.slice(6).trim()
+          else if (line.startsWith("data:")) dataRaw += line.slice(5)
+        }
+
+        if (ev === "ask") {
+          try {
+            const payload = JSON.parse(dataRaw) as { question?: string }
+            const q = simplifyAskQuestion(payload?.question || "")
+            const slot = classifyAskSlot(q)
+            const askedState = askedThisTurnRef.current
+
+            // Dedupe/throttle/onderdrukken
+            const exceedGlobal = askedState.total >= 1
+            const seenBefore = askedState.seenTexts.has(q)
+            const blockedByDontKnow = slot ? slotsUserDoesNotKnow.has(slot) : false
+
+            if (!q || seenBefore || exceedGlobal || blockedByDontKnow || DEFAULT_POLICY.preferAdviceOverQuestions) {
+              // sla deze vraag over; backend blijft toch doorgaan met advies
+            } else {
+              askedState.total += 1
+              askedState.seenTexts.add(q)
+              if (slot) askedState.perSlot[slot] = (askedState.perSlot[slot] || 0) + 1
+              pushAssistantText(q)
+            }
+          } catch {}
+        } else if (ev === "assumptions") {
+          try {
+            const arr = JSON.parse(dataRaw) as string[] | undefined
+            if (Array.isArray(arr) && arr.length) setAssumptions(arr.slice(0, DEFAULT_POLICY.assumptions.max))
+          } catch {}
+        } else if (ev === "needs") {
+          try {
+            const payload = (JSON.parse(dataRaw) as NeedsPayload) || {}
+            if (payload?.contextOut) setContext((c) => deepMerge(c, payload.contextOut))
+          } catch {}
+        } else if (ev === "context") {
+          try {
+            const ctx = JSON.parse(dataRaw) as ContextPayload
+            const nice = formatSeasonNote(ctx?.season ?? null, ctx?.seasonalRisks)
+            if (nice) setSeasonHint(nice)
+            setSeasonMeta({ risks: ctx?.seasonalRisks || [], adviceFlags: ctx?.adviceFlags || {} })
+            const { season, seasonalRisks, adviceFlags, itemTags, ...rest } = ctx || {}
+            if (Object.keys(rest).length) setContext((c) => deepMerge(c, rest))
+          } catch {}
+        } else if (ev === "start") {
+          hasStarted = true
+          streamedText = ""
+          pushAssistantHTML(formatToChatUI("", { summaryOnly: true }))
+        } else if (ev === "delta" && hasStarted) {
+          let add = ""
+          try {
+            const maybe = JSON.parse(dataRaw)
+            if (typeof maybe === "string") add = maybe
+            else if (typeof (maybe as any)?.text === "string") add = (maybe as any).text
+            else add = dataRaw
+          } catch { add = dataRaw }
+          streamedText += add
+          setMessages((msgs) => {
+            const copy = [...msgs]
+            for (let i = copy.length - 1; i >= 0; i--) {
+              if (copy[i].role === "assistant" && "html" in copy[i]) {
+                copy[i] = { role: "assistant", html: formatToChatUI(streamedText, { summaryOnly: true }) }
+                break
+              }
+            }
+            return copy
+          })
+        } else if (ev === "products") {
+          try {
+            const incoming = (JSON.parse(dataRaw) as ProductsEvent) || []
+            const clean = dedupeProducts(incoming)
+            setProducts((prev) => dedupeProducts([...(prev || []), ...clean]))
+          } catch {}
+        } else if (ev === "error") {
+          try { setError((JSON.parse(dataRaw) as any)?.message || "Onbekende fout uit stream") } catch { setError(dataRaw || "Onbekende fout uit stream") }
+          break
+        } else if (ev === "done") {
+          break
+        }
+      }
+
+      setRunning(false); setThinking(false); abortRef.current = null
+    } catch (e: any) {
+      setError(e?.message || "Onbekende fout")
+      setRunning(false); setThinking(false)
+    }
+  }
+
+  /* ---------- Input handlers ---------- */
+  const onKeyDown: React.KeyboardEventHandler<HTMLInputElement> = (e) => {
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); handleUserSend(input) }
+  }
+
+  function handleUserSend(message: string) {
+    if (!message.trim() || running) return
+    setMessages((m) => [...m, { role: "user", text: message }])
+    setInput("")
+    resetTurnSideEffects()
+
+    // Als user "weet ik niet" zegt: markeer de op dit moment ontbrekende slots als 'user-dont-know'
+    if (DONT_KNOW_RE.test(message)) {
+      const missingNow: StepId[] = []
+      if (!context.destination?.country) missingNow.push("countries")
+      if (!context.month && !context.startDate) missingNow.push("period")
+      if (!context.durationDays) missingNow.push("duration")
+      if (!context.activities?.length) missingNow.push("activities")
+      setSlotsUserDoesNotKnow(new Set(missingNow))
+      pushAssistantText("Geen probleem — ik geef alvast concreet advies met aannames. Vul aan zodra je meer weet.")
+    }
+
+    // Optimistisch bijwerken & hints
+    extractFromText(message)
+    const hints = nluHintsFrom(message, context)
+    if (hints.paraphrase) pushAssistantText(`${hints.paraphrase} Ik geef alvast advies met aannames waar nodig.`)
+
+    // Altijd backend laten adviseren (policy regelt vragen vs advies)
+    const history = buildHistoryForBackend([...messages, { role: "user", text: message }])
+    return sendToBackend(message, history, hints)
+  }
+
+  /* ---------- UI ---------- */
+  const chips = [
+    { label: "Land", value: context.destination?.country || undefined, onEdit: () => setInput("Ik ga naar …") },
+    { label: "Periode", value: context.month || context.startDate || undefined, onEdit: () => setInput("Ik ga in …") },
+    { label: "Duur", value: context.durationDays ? `${context.durationDays} dagen` : undefined, onEdit: () => setInput("Ik ga ongeveer … dagen weg") },
+    { label: "Activiteiten", value: context.activities?.length ? context.activities.join(", ") : undefined, onEdit: () => setInput("Ik wil o.a. hiken/surfen/…") },
+  ]
+
+  const missing = [
+    !context.destination?.country && "bestemming",
+    !(context.month || context.startDate) && "periode",
+    !context.durationDays && "duur",
+    !(context.activities?.length) && "activiteiten",
+  ].filter(Boolean) as string[]
+
+  return (
+    <div style={{ ...container, background: theme.bg, color: theme.text }}>
+      {/* Header + Dark mode */}
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <h3 style={{ margin: 0 }}>Packlist Assistant</h3>
+        <label style={{ fontSize: 12, cursor: "pointer" }}>
+          <input type="checkbox" checked={darkMode} onChange={() => setDarkMode((v) => !v)} style={{ marginRight: 6 }} />
+          Dark mode
+        </label>
+      </div>
+
+      {showHint && (
+        <div style={{ ...muted }}>
+          Tip: typ vrijuit (bv. “45 dagen Vietnam in juli, hiken &amp; duiken”). Ik kan ook alvast advies geven als nog niet alles bekend is.
+        </div>
+      )}
+
+      {/* Partial info banner */}
+      {!!missing.length && (
+        <div style={{ ...muted, padding: "6px 8px", border: `1px dashed ${theme.border}`, borderRadius: 8 }}>
+          Niet alles is ingevuld ({missing.join(", ")}). Ik geef voorlopig advies met aannames. Pas gerust later aan.
+        </div>
+      )}
+
+      {/* Assumptions (optioneel vanuit backend) */}
+      {!!assumptions.length && (
+        <div style={{ ...muted }}>
+          Aannames: {assumptions.map((a, i) => <span key={i} style={{ display:"inline-block", marginRight:8 }}>• {a}</span>)}
+        </div>
+      )}
+
+      {seasonHint && <div style={{ ...muted }}>{seasonHint}</div>}
+      {error && (
+        <div style={{ ...errorBox, background: theme.errorBg, color: theme.errorText, borderColor: theme.errorBorder }}>
+          <strong>Fout:</strong> {error}
+        </div>
+      )}
+
+      {/* Chat */}
+      <div style={chatScroll(theme)}>
+        {messages.map((m, i) => (
+          <div key={i} style={{ display: "flex", justifyContent: m.role === "user" ? "flex-end" : "flex-start" }}>
+            <div style={{ ...bubbleBase, ...(m.role === "user" ? bubbleUser(theme) : bubbleAssistant(theme)) }}>
+              {"html" in m && m.html ? <div dangerouslySetInnerHTML={{ __html: m.html }} /> : <div>{m.text}</div>}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {/* Samenvattingschips */}
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+        {chips.map((c, idx) => (
+          <div key={idx} style={{ display: "inline-flex", alignItems: "center", gap: 8, padding: "6px 10px", borderRadius: 999, border: `1px solid ${theme.border}`, background: theme.cardBg, fontSize: 12 }} title="Klik om te bewerken">
+            <span style={{ opacity: 0.75 }}>{c.label}:</span>
+            <span>{c.value || "—"}</span>
+            <button onClick={c.onEdit} style={{ ...btnBase, height: 24, padding: "0 8px", borderRadius: 999, background: "transparent", border: `1px solid ${theme.border}`, fontSize: 12 }}>✎</button>
+          </div>
+        ))}
+      </div>
+
+      {/* Input */}
+      <div style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: 8 }}>
+        <input
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          onKeyDown={onKeyDown}
+          placeholder="Schrijf hier… bv. 'januari Azië, paar maanden, surfen'"
+          style={{ ...inputStyle, background: theme.inputBg, color: theme.text, borderColor: theme.border }}
+          disabled={running}
+        />
+        <button onClick={() => handleUserSend(input)} disabled={!input.trim() || running} style={{ ...btnPrimary, background: theme.buttonBg, color: theme.buttonText }}>
+          Verstuur
+        </button>
+        {running && (
+          <button onClick={handleStop} style={btnDanger} aria-label="Stop genereren">
+            Stop
+          </button>
+        )}
+      </div>
+
+      {/* Suggested Products */}
+      <div style={{ display: "grid", gap: 8 }}>
+        <div style={sectionTitle}>Suggested Products</div>
+        {products?.length ? (
+          <ul style={productsGrid}>
+            {products.map((p, i) => {
+              const key = productKey(p, i)
+              const isSelected = !!selected[key]
+              const card: React.CSSProperties = {
+                ...productCard,
+                position: "relative",
+                borderColor: isSelected ? SELECTED.border : theme.border,
+                background: isSelected ? SELECTED.bg : theme.cardBg,
+                color: isSelected ? "#ffffff" : theme.text,
+                boxShadow: isSelected ? "0 6px 18px rgba(34,197,94,.35)" : darkMode ? "0 2px 10px rgba(0,0,0,.35)" : "0 2px 10px rgba(0,0,0,.06)",
+                transition: "background .15s ease, border-color .15s ease, color .15s ease, box-shadow .15s ease",
+                cursor: "pointer",
+              }
+              const checkBox: React.CSSProperties = {
+                position: "absolute", top: 10, right: 10, width: 22, height: 22, borderRadius: 8, border: `1px solid ${isSelected ? "#ffffff" : theme.border}`,
+                display: "grid", placeItems: "center", fontSize: 14, lineHeight: 1, background: isSelected ? "rgba(255,255,255,0.22)" : "transparent", color: isSelected ? "#ffffff" : theme.text, pointerEvents: "none",
+              }
+              const brandBox: React.CSSProperties = {
+                position: "absolute", top: 40, right: 10, display: "flex", alignItems: "center", justifyContent: "center", padding: 6, width: 34, height: 34, borderRadius: 10,
+                border: `1px solid ${isSelected ? "rgba(255,255,255,0.6)" : theme.border}`,
+                background: isSelected ? "rgba(255,255,255,0.20)" : darkMode ? "rgba(255,255,255,0.06)" : "rgba(15,23,42,0.03)",
+                color: isSelected ? "#ffffff" : darkMode ? "#e5e7eb" : "#111827",
+                boxShadow: darkMode ? "0 2px 8px rgba(0,0,0,.25)" : "0 2px 8px rgba(0,0,0,.08)", userSelect: "none",
+              }
+              const linkStyle: React.CSSProperties = { ...link, color: isSelected ? "#ffffff" : theme.link }
+
+              return (
+                <li key={key} style={card} onClick={() => toggleSelected(key)} aria-pressed={isSelected}>
+                  <div style={checkBox}>{isSelected ? "✓" : ""}</div>
+                  <div style={brandBox} title="Externe website (binnenkort)" onClick={(e) => e.stopPropagation()}>
+                    <BrandIcon color={isSelected ? "#ffffff" : darkMode ? "#e5e7eb" : "#111827"} />
+                  </div>
+                  <div style={{ fontWeight: 600 }}>{p.name || "Product"}</div>
+                  <div style={{ ...muted, color: isSelected ? "rgba(255,255,255,0.9)" : undefined }}>
+                    {p.category ? `${p.category} • ` : ""}{p.weight_grams ? `${p.weight_grams}g` : "—"}
+                  </div>
+                  {p.url && (
+                    <a href={p.url} target="_blank" rel="noreferrer" style={linkStyle} onClick={(e) => e.stopPropagation()}>
+                      Bekijk product →
+                    </a>
+                  )}
+                </li>
+              )
+            })}
+          </ul>
+        ) : (
+          <div style={{ opacity: 0.8 }}>Nog geen suggesties…</div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+/* ---------- Thema’s ---------- */
+const light = { bg: "white", text: "#0b0f19", border: "rgba(0,0,0,0.12)", inputBg: "white", buttonBg: "black", buttonText: "white", outputBg: "rgba(0,0,0,0.02)", link: "#111827", errorBg: "rgba(239,68,68,.08)", errorText: "#7f1d1d", errorBorder: "rgba(239,68,68,.35)", cardBg: "#ffffff" }
+const dark = { bg: "#0f1117", text: "#f3f4f6", border: "rgba(255,255,255,0.15)", inputBg: "#1a1c23", buttonBg: "#f3f4f6", buttonText: "#0f1117", outputBg: "#1a1c23", link: "#93c5fd", errorBg: "rgba(239,68,68,.15)", errorText: "#fee2e2", errorBorder: "rgba(239,68,68,.35)", cardBg: "#171a23" }
+
+/* ---------- Styles ---------- */
+const container: React.CSSProperties = { fontFamily: "Poppins, Inter, system-ui, -apple-system, Segoe UI, Roboto, sans-serif", display: "grid", gap: 14, padding: 16, width: "100%", boxSizing: "border-box", maxWidth: 720, margin: "0 auto", transition: "background 0.3s, color 0.3s" }
+const inputStyle: React.CSSProperties = { height: 36, padding: "0 12px", borderRadius: 10, border: "1px solid", outline: "none", fontSize: 14, width: "100%" }
+const btnBase: React.CSSProperties = { height: 36, padding: "0 14px", borderRadius: 10, border: "1px solid transparent", fontSize: 14, cursor: "pointer" }
+const btnPrimary: React.CSSProperties = { ...btnBase }
+const btnDanger: React.CSSProperties = { ...btnBase, background: "#ef4444", color: "white" }
+const sectionTitle: React.CSSProperties = { fontWeight: 600 }
+const chatScroll = (theme: any): React.CSSProperties => ({ border: "1px solid", borderColor: theme.border, borderRadius: 16, padding: 12, maxHeight: 520, minHeight: 200, overflowY: "auto", background: theme.outputBg })
+const bubbleBase: React.CSSProperties = { borderRadius: 14, padding: "8px 12px", margin: "6px 0", maxWidth: "84%", lineHeight: 1.6, wordBreak: "break-word" }
+const bubbleUser = (theme: any): React.CSSProperties => ({ background: theme.buttonBg, color: theme.buttonText })
+const bubbleAssistant = (_theme: any): React.CSSProperties => ({ background: "rgba(0,0,0,.04)" })
+const productsGrid: React.CSSProperties = { listStyle: "none", padding: 0, margin: 0, display: "grid", gap: 10, gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))" }
+const productCard: React.CSSProperties = { border: "1px solid", borderRadius: 12, padding: 12, display: "grid", gap: 6, minHeight: 96, overflow: "hidden" }
+const muted: React.CSSProperties = { fontSize: 12, opacity: 0.8 }
+const link: React.CSSProperties = { fontSize: 12, textDecoration: "underline" }
+const errorBox: React.CSSProperties = { padding: 10, borderRadius: 10, border: "1px solid" }
+const SELECTED = { bg: "#22c55e", border: "#16a34a" }
