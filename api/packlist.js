@@ -2,10 +2,10 @@ import * as React from "react"
 
 /**
  * PacklistAssistant — Advies óók bij ontbrekende info
- * - Stuurt altijd naar backend (policy: allowPartial, preferAdviceOverQuestions)
- * - Herkent "weet ik (nog) niet" en onderdrukt vervolgvragen over die slots
- * - Dedupe/throttle van 'ask' SSE-events (max 1 per beurt, geen repeats)
- * - Toont optioneel 'assumptions' (als backend dat event stuurt)
+ * - UI: per veld een "Weet ik niet" knop (cleart context + onderdrukt vragen)
+ * - Herkent "weet ik (nog) niet" in vrije tekst (blijft bestaan)
+ * - Zodra user later wél info geeft, wordt de 'onbekend' vlag voor dat slot gewist
+ * - Dedupe/throttle van 'ask' SSE-events + advies-first policy
  */
 
 const API_BASE = "https://packlist-bot.vercel.app" // jouw backend
@@ -391,8 +391,10 @@ export default function PacklistAssistant({ showHint = true }: Props) {
     preferences: null,
   })
 
-  // Voor onderdrukking van vragen:
+  // Slots die user expliciet "onbekend" heeft gezet
   const [slotsUserDoesNotKnow, setSlotsUserDoesNotKnow] = React.useState<Set<StepId>>(new Set())
+
+  // Per-beurt throttling van 'ask'
   const askedThisTurnRef = React.useRef<{ seenTexts: Set<string>; perSlot: Record<StepId, number>; total: number }>({
     seenTexts: new Set(),
     perSlot: { countries: 0, period: 0, duration: 0, activities: 0 },
@@ -423,13 +425,19 @@ export default function PacklistAssistant({ showHint = true }: Props) {
     return `Seizoen: ${season}`
   }
 
-  /* ---------- Optimistisch updaten ---------- */
+  /* ---------- Optimistisch updaten + 'unknown' resetten als user alsnog info geeft ---------- */
   function extractFromText(t: string) {
     if (!t) return
+    let updated = { ...context }
+
     // LAND
     const cRx = new RegExp(`\\b(${COUNTRY_LIST.join("|")})\\b`, "i")
     const country = t.match(cRx)?.[0]
-    if (country) setContext((c) => deepMerge(c, { destination: { country, region: null } }))
+    if (country) {
+      updated = deepMerge(updated, { destination: { country, region: null } })
+      setSlotsUserDoesNotKnow((prev) => { const n = new Set(prev); n.delete("countries"); return n })
+    }
+
     // DUUR
     const dur = t.match(/\b(\d{1,3})\s*(dagen|dag|weken|week|maanden|maand|d|w|m)\b/i)
     if (dur) {
@@ -437,11 +445,18 @@ export default function PacklistAssistant({ showHint = true }: Props) {
       const n = parseInt(nStr, 10)
       const unit = unitRaw.toLowerCase()
       const days = unit.startsWith("w") ? n * 7 : unit.startsWith("m") ? n * 30 : n
-      setContext((c) => deepMerge(c, { durationDays: Number.isFinite(days) ? days : null }))
+      updated = deepMerge(updated, { durationDays: Number.isFinite(days) ? days : null })
+      setSlotsUserDoesNotKnow((prev) => { const nset = new Set(prev); nset.delete("duration"); return nset })
     }
+
     // PERIODE (maand)
     const month = t.match(/\b(januari|februari|maart|april|mei|juni|juli|augustus|september|oktober|november|december)\b/i)?.[0]
-    if (month) setContext((c) => deepMerge(c, { month: month.toLowerCase() }))
+    if (month) {
+      updated = deepMerge(updated, { month: month.toLowerCase() })
+      setSlotsUserDoesNotKnow((prev) => { const n = new Set(prev); n.delete("period"); return n })
+    }
+
+    setContext(updated)
   }
 
   /* ---------- Backend trigger (policy + history + nluHints) ---------- */
@@ -565,7 +580,7 @@ export default function PacklistAssistant({ showHint = true }: Props) {
     setInput("")
     resetTurnSideEffects()
 
-    // Als user "weet ik niet" zegt: markeer de op dit moment ontbrekende slots als 'user-dont-know'
+    // User zegt "weet ik niet" → markeer alle huidige missende slots als unknown
     if (DONT_KNOW_RE.test(message)) {
       const missingNow: StepId[] = []
       if (!context.destination?.country) missingNow.push("countries")
@@ -576,7 +591,7 @@ export default function PacklistAssistant({ showHint = true }: Props) {
       pushAssistantText("Geen probleem — ik geef alvast concreet advies met aannames. Vul aan zodra je meer weet.")
     }
 
-    // Optimistisch bijwerken & hints
+    // Optimistisch bijwerken & hints (en unknown-vlaggen resetten als er info binnenkomt)
     extractFromText(message)
     const hints = nluHintsFrom(message, context)
     if (hints.paraphrase) pushAssistantText(`${hints.paraphrase} Ik geef alvast advies met aannames waar nodig.`)
@@ -586,12 +601,26 @@ export default function PacklistAssistant({ showHint = true }: Props) {
     return sendToBackend(message, history, hints)
   }
 
+  /* ---------- Chip-acties: expliciet "Weet ik niet" ---------- */
+  function clearSlotAndMarkUnknown(slot: StepId) {
+    setContext((c) => {
+      const n = { ...c }
+      if (slot === "countries") n.destination = { country: null, region: null }
+      if (slot === "period") { n.month = null; n.startDate = null; n.endDate = null }
+      if (slot === "duration") n.durationDays = null
+      if (slot === "activities") n.activities = []
+      return n
+    })
+    setSlotsUserDoesNotKnow((prev) => new Set(prev).add(slot))
+    pushAssistantText("Top, ik negeer dit onderdeel voorlopig en geef advies met aannames.")
+  }
+
   /* ---------- UI ---------- */
   const chips = [
-    { label: "Land", value: context.destination?.country || undefined, onEdit: () => setInput("Ik ga naar …") },
-    { label: "Periode", value: context.month || context.startDate || undefined, onEdit: () => setInput("Ik ga in …") },
-    { label: "Duur", value: context.durationDays ? `${context.durationDays} dagen` : undefined, onEdit: () => setInput("Ik ga ongeveer … dagen weg") },
-    { label: "Activiteiten", value: context.activities?.length ? context.activities.join(", ") : undefined, onEdit: () => setInput("Ik wil o.a. hiken/surfen/…") },
+    { slot: "countries" as StepId, label: "Land", value: context.destination?.country || undefined, onEdit: () => setInput("Ik ga naar …") },
+    { slot: "period" as StepId, label: "Periode", value: context.month || context.startDate || undefined, onEdit: () => setInput("Ik ga in …") },
+    { slot: "duration" as StepId, label: "Duur", value: context.durationDays ? `${context.durationDays} dagen` : undefined, onEdit: () => setInput("Ik ga ongeveer … dagen weg") },
+    { slot: "activities" as StepId, label: "Activiteiten", value: context.activities?.length ? context.activities.join(", ") : undefined, onEdit: () => setInput("Ik wil o.a. hiken/surfen/…") },
   ]
 
   const missing = [
@@ -650,15 +679,64 @@ export default function PacklistAssistant({ showHint = true }: Props) {
         ))}
       </div>
 
-      {/* Samenvattingschips */}
+      {/* Samenvattingschips + "Weet ik niet" */}
       <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
-        {chips.map((c, idx) => (
-          <div key={idx} style={{ display: "inline-flex", alignItems: "center", gap: 8, padding: "6px 10px", borderRadius: 999, border: `1px solid ${theme.border}`, background: theme.cardBg, fontSize: 12 }} title="Klik om te bewerken">
-            <span style={{ opacity: 0.75 }}>{c.label}:</span>
-            <span>{c.value || "—"}</span>
-            <button onClick={c.onEdit} style={{ ...btnBase, height: 24, padding: "0 8px", borderRadius: 999, background: "transparent", border: `1px solid ${theme.border}`, fontSize: 12 }}>✎</button>
-          </div>
-        ))}
+        {chips.map((c, idx) => {
+          const unknown = slotsUserDoesNotKnow.has(c.slot)
+          return (
+            <div
+              key={idx}
+              style={{
+                display: "inline-flex",
+                alignItems: "center",
+                gap: 8,
+                padding: "6px 10px",
+                borderRadius: 999,
+                border: `1px solid ${theme.border}`,
+                background: theme.cardBg,
+                fontSize: 12,
+              }}
+              title="Klik om te bewerken of markeer als 'Weet ik niet'"
+            >
+              <span style={{ opacity: 0.75 }}>{c.label}:</span>
+              <span>{c.value || (unknown ? "— (onbekend)" : "—")}</span>
+
+              {/* Bewerken */}
+              <button
+                onClick={c.onEdit}
+                style={{
+                  ...btnBase,
+                  height: 24,
+                  padding: "0 8px",
+                  borderRadius: 999,
+                  background: "transparent",
+                  border: `1px solid ${theme.border}`,
+                  fontSize: 12,
+                }}
+              >
+                ✎
+              </button>
+
+              {/* Weet ik niet */}
+              <button
+                onClick={() => clearSlotAndMarkUnknown(c.slot)}
+                style={{
+                  ...btnBase,
+                  height: 24,
+                  padding: "0 10px",
+                  borderRadius: 999,
+                  background: "transparent",
+                  border: `1px dashed ${theme.border}`,
+                  fontSize: 12,
+                  opacity: 0.85,
+                }}
+                title="Markeer als 'Weet ik niet' (wordt tijdelijk genegeerd)"
+              >
+                Weet ik niet
+              </button>
+            </div>
+          )
+        })}
       </div>
 
       {/* Input */}
@@ -667,7 +745,7 @@ export default function PacklistAssistant({ showHint = true }: Props) {
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={onKeyDown}
-          placeholder="Schrijf hier… bv. 'januari Azië, paar maanden, surfen'"
+          placeholder="Schrijf hier… bv. 'januari Azië, paar maanden, surfen' of 'weet ik nog niet'"
           style={{ ...inputStyle, background: theme.inputBg, color: theme.text, borderColor: theme.border }}
           disabled={running}
         />
