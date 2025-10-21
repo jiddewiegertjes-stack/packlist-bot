@@ -1,17 +1,18 @@
 import * as React from "react"
 
 /**
- * PacklistAssistant — Conversational NLU upgrade
- * ------------------------------------------------
- * Goals
- * - Make free‑form chat feel natural (understands paraphrases, corrections, add/remove)
- * - Keep slot‑filling, but drive follow‑ups with confidence + paraphrase
- * - Send richer "nluHints" + "history" to backend so the LLM can infer rest
- * - Zero extra deps; pure TS + a tiny fuzzy/regex layer for NL/EN
+ * PacklistAssistant — ChatGPT‑achtig gedrag (drop‑in)
+ * --------------------------------------------------
+ * Doel
+ * - Vrij praten zoals in ChatGPT; LLM mag interpreteren ("rond de jaarwisseling", "paar maanden").
+ * - Frontend stelt géén eigen vragen als backend dat doet (geen dubbele prompts).
+ * - Stuurt naast history/context ook raw taal-hints (durationPhrase, periodPhrase) + policy
+ *   zodat de backend/LLM het mag schatten/normaliseren.
  *
- * How to use
- * - Drop‑in replacement for your current component
- * - API contract: POST { message, context, history, nluHints }
+ * Gebruik
+ * - Vervang je huidige component 1‑op‑1 met dit bestand.
+ * - Backend endpoint blijft: POST ${API_BASE}/api/packlist met
+ *   { message, context, history, nluHints }.
  */
 
 const API_BASE = "https://packlist-bot.vercel.app"
@@ -40,19 +41,15 @@ type ContextPayload = {
 }
 
 type StepId = "countries" | "period" | "duration" | "activities"
-
 const ASK_ORDER: readonly StepId[] = ["countries", "period", "duration", "activities"]
 
 type ChatMsg = { role: "user" | "assistant"; html?: string; text?: string }
 
 /**
  * ===== Natural Language Layer =====
- * Minimal, dependency‑free NLU that extracts:
- * - countries (with simple fuzzy & synonyms)
- * - duration (days/weeks/months)
- * - date ranges and months (incl. NL idioms like "t/m", "vanaf", "over 2 weken")
- * - activities (add/remove, negation aware)
- * - intent (correction/update vs new info vs meta like "maak compacter")
+ * Klein, dependency‑vrij NLU‑laagje om hints te sturen naar de backend.
+ * We **normaliseren niet** agressief in de frontend; we capteren vooral ruwe
+ * taal als hints (durationPhrase/periodPhrase) en laten het LLM redeneren.
  */
 
 /* --- Utils --- */
@@ -61,56 +58,32 @@ const stripDiacritics = (s = "") => s
   .replace(/\p{Diacritic}+/gu, "")
   .toLowerCase()
 
-const within = (v: number, target: number, tol = 2) => Math.abs(v - target) <= tol
-
-// very tiny fuzzy: accepts token if at least 70% of chars match in correct order
 function fuzzyIncludes(hay: string, needle: string) {
-  hay = stripDiacritics(hay)
-  needle = stripDiacritics(needle)
+  hay = stripDiacritics(hay); needle = stripDiacritics(needle)
   if (hay.includes(needle)) return true
   if (needle.length < 4) return false
-  let i = 0
-  for (const ch of hay) if (ch === needle[i]) i++
+  let i = 0; for (const ch of hay) if (ch === needle[i]) i++
   return i / needle.length >= 0.7
 }
 
 /* --- Lexicons --- */
 const COUNTRY_SYNS: Record<string, string[]> = {
   nederland: ["nl", "netherlands", "holland"],
-  portugal: [],
-  spanje: ["spanje", "spain"],
-  italie: ["italië", "italie", "italy"],
-  frankrijk: ["france"],
-  griekenland: ["greece"],
-  turkije: ["turkey"],
-  marokko: ["morocco"],
-  mexico: [],
-  peru: [],
-  argentinie: ["argentina", "argentinië"],
-  chili: ["chile"],
-  japan: ["japan"],
-  korea: ["zuid-korea", "south korea", "korea"],
-  vietnam: [],
-  filipijnen: ["philippines", "philippijnen"],
-  indonesie: ["indonesië", "bali", "java", "lombok"],
-  thailand: ["thailand", "thai"],
-  cambodja: ["cambodia"],
-  laos: [],
-  noorwegen: ["norway"],
-  zweden: ["sweden"],
-  finland: ["finland"],
-  canada: [],
+  portugal: [], spanje: ["spanje", "spain"], italie: ["italië", "italie", "italy"],
+  frankrijk: ["france"], griekenland: ["greece"], turkije: ["turkey"], marokko: ["morocco"],
+  mexico: [], peru: [], argentinie: ["argentina", "argentinië"], chili: ["chile"],
+  japan: ["japan"], korea: ["zuid-korea", "south korea", "korea"], vietnam: [],
+  filipijnen: ["philippines", "philippijnen"], indonesie: ["indonesië", "bali", "java", "lombok"],
+  thailand: ["thailand", "thai"], cambodja: ["cambodia"], laos: [],
+  noorwegen: ["norway"], zweden: ["sweden"], finland: ["finland"], canada: [],
   "verenigde staten": ["vs", "usa", "united states", "amerika"],
-  australie: ["australië", "australia"],
-  "nieuw-zeeland": ["new zealand", "nz"]
+  australie: ["australië", "australia"], "nieuw-zeeland": ["new zealand", "nz"]
 }
 
 const ACT_SYNS: Record<string, string[]> = {
   hiken: ["wandelen", "trekking", "bergen in"],
-  duiken: ["scuba", "duik", "padi"],
-  snorkelen: ["snorkel"],
-  surfen: ["surf", "golfsurfen"],
-  skien: ["skiën", "ski", "snowboarden"],
+  duiken: ["scuba", "duik", "padi"], snorkelen: ["snorkel"],
+  surfen: ["surf", "golfsurfen"], skien: ["skiën", "ski", "snowboarden"],
   kamperen: ["kamperen", "tent", "wildkamperen"],
   klimmen: ["boulderen", "alpinisme"],
   fietsen: ["bikepacking", "mtb", "wielrennen"],
@@ -118,9 +91,8 @@ const ACT_SYNS: Record<string, string[]> = {
 }
 
 const MONTHS: Record<string, number> = {
-  januari: 0, februari: 1, maart: 2, april: 3, mei: 4, juni: 5,
-  juli: 6, augustus: 7, september: 8, oktober: 9, november: 10, december: 11,
-  january: 0, february: 1, march: 2, may: 4, june: 5, july: 6, august: 7,
+  januari:0,februari:1,maart:2,april:3,mei:4,juni:5,juli:6,augustus:7,september:8,oktober:9,november:10,december:11,
+  january:0,february:1,march:2,may:4,june:5,july:6,august:7,
 }
 
 /* --- Parsing helpers --- */
@@ -136,11 +108,11 @@ function findCountry(t: string): string | null {
   return null
 }
 
+// Alleen harde numerieke duur ("6 weken", "45 dagen"). Vage taal laten we aan het LLM.
 function parseDuration(t: string): number | null {
   const m = t.match(/\b(\d{1,3})\s*(dagen|dag|weken|week|maanden|maand|d|w|m)\b/i)
   if (!m) return null
-  const n = parseInt(m[1], 10)
-  const unit = m[2].toLowerCase()
+  const n = parseInt(m[1], 10); const unit = m[2].toLowerCase()
   if (unit.startsWith("w")) return n * 7
   if (unit.startsWith("m")) return n * 30
   return n
@@ -153,36 +125,25 @@ function toISO(d: Date) {
 
 function parsePeriod(t: string): { startDate?: string|null; endDate?: string|null; month?: string|null } {
   const lower = stripDiacritics(t)
-  // explicit ranges: 5-12 juni / 5 tot 12 juni / 1 t/m 10 mei / 12-26 aug 2026
   const range = lower.match(/\b(\d{1,2})\s*(?:-|t\/m|tot)\s*(\d{1,2})\s*(januari|februari|maart|april|mei|juni|juli|augustus|september|oktober|november|december|jan|feb|mrt|apr|aug|sep|oct|okt|nov|dec|mei)\s*(\d{4})?\b/)
   if (range) {
-    const d1 = parseInt(range[1], 10)
-    const d2 = parseInt(range[2], 10)
+    const d1 = parseInt(range[1], 10); const d2 = parseInt(range[2], 10)
     const monthTxt = range[3].startsWith("okt") ? "oktober" : range[3]
     const mIdx = MONTHS[monthTxt as keyof typeof MONTHS] ?? MONTHS[monthTxt as any]
     const year = range[4] ? parseInt(range[4], 10) : new Date().getFullYear()
-    const s = new Date(Date.UTC(year, mIdx, d1))
-    const e = new Date(Date.UTC(year, mIdx, d2))
+    const s = new Date(Date.UTC(year, mIdx, d1)); const e = new Date(Date.UTC(year, mIdx, d2))
     return { startDate: toISO(s), endDate: toISO(e), month: null }
   }
-  // vanaf 12 juli, tot 3 september
   const vanaf = lower.match(/vanaf\s+(\d{1,2})\s+(\w+)/)
   if (vanaf) {
-    const d = parseInt(vanaf[1], 10)
-    const mIdx = MONTHS[vanaf[2] as keyof typeof MONTHS]
-    const y = new Date().getFullYear()
+    const d = parseInt(vanaf[1], 10); const mIdx = MONTHS[vanaf[2] as keyof typeof MONTHS]; const y = new Date().getFullYear()
     return { startDate: toISO(new Date(Date.UTC(y, mIdx, d))), endDate: null, month: null }
   }
-  // month only
   const m = lower.match(/\b(januari|februari|maart|april|mei|juni|juli|augustus|september|oktober|november|december|january|february|march|may|june|july|august|september|october|november|december)\b/)
   if (m) return { month: m[0], startDate: null, endDate: null }
-  // relative: over 2 weken/maanden
   const rel = lower.match(/over\s+(\d{1,2})\s*(weken|maanden|dagen|weeks|months|days)/)
   if (rel) {
-    const n = parseInt(rel[1], 10)
-    const unit = rel[2]
-    const now = new Date()
-    const start = new Date(now)
+    const n = parseInt(rel[1], 10); const unit = rel[2]; const now = new Date(); const start = new Date(now)
     if (/week/i.test(unit)) start.setUTCDate(start.getUTCDate() + n * 7)
     else if (/maand|month/i.test(unit)) start.setUTCMonth(start.getUTCMonth() + n)
     else start.setUTCDate(start.getUTCDate() + n)
@@ -193,8 +154,7 @@ function parsePeriod(t: string): { startDate?: string|null; endDate?: string|nul
 
 function extractActivities(t: string) {
   const neg = /\b(geen|niet|no)\b/i
-  const removes: string[] = []
-  const adds: string[] = []
+  const removes: string[] = []; const adds: string[] = []
   for (const [canon, syns] of Object.entries(ACT_SYNS)) {
     const hits = [canon, ...syns].some(s => fuzzyIncludes(t, s))
     if (hits) (neg.test(t) ? removes : adds).push(canon)
@@ -212,27 +172,38 @@ type NLUHints = {
   lang: "nl"|"en"
   country?: string|null
   durationDays?: number|null
+  /** ruwe gebruikerstaal, bv. "maandje of 3", "paar maanden" */
+  durationPhrase?: string|null
+  /** ruwe periodefrasen, bv. "rond de jaarwisseling", "komende meivakantie" */
+  periodPhrase?: string|null
   startDate?: string|null
   endDate?: string|null
   month?: string|null
   activitiesAdd?: string[]
   activitiesRemove?: string[]
   confidence: number // 0..1
-  paraphrase?: string // "If I understood you correctly …"
+  paraphrase?: string
+  policy?: { allowApproximate?: boolean; preferLLMInference?: boolean }
 }
 
 function nlu(t: string, prev: Ctx): NLUHints {
   const lang = detectLanguage(t)
   const c = findCountry(t)
-  const dur = parseDuration(t)
+  const dur = parseDuration(t) // alleen als expliciet nummer aanwezig is
   const per = parsePeriod(t)
   const acts = extractActivities(t)
 
-  // confidence heuristic
+  // capture vrije frasen voor LLM
+  const dp = t.match(/\b(weekje(?:\s*of\s*zo)?|maandje(?:\s*of\s*zo)?|paar\s*weken|paar\s*maanden|maandje\s*of\s*\d+|rond\s+de\s+jaarwisseling|rond\s+kerst|in\s+de\s+zomer|in\s+de\s+winter)\b[^,.!]*/i)
+  const durationPhrase = dp ? dp[0].trim() : null
+
+  const pp = t.match(/\b(rond\s+de\s+jaarwisseling|rond\s+kerst|met\s+oud\s*\&\s*nieuw|komende\s+meivakantie|herfstvakantie|zomervakantie)\b[^,.!]*/i)
+  const periodPhrase = pp ? pp[0].trim() : null
+
   let score = 0
   if (c) score += .3
-  if (dur) score += .25
-  if (per.month || per.startDate) score += .25
+  if (dur || durationPhrase) score += .25
+  if (per.month || per.startDate || periodPhrase) score += .25
   if (acts.adds.length) score += .2
   score = Math.min(1, score)
 
@@ -240,7 +211,9 @@ function nlu(t: string, prev: Ctx): NLUHints {
   if (c) pieces.push(`land: ${c}`)
   if (per.month) pieces.push(`periode: ${per.month}`)
   else if (per.startDate) pieces.push(`periode: ${per.startDate}${per.endDate ? ` → ${per.endDate}`: ""}`)
+  else if (periodPhrase) pieces.push(`periode (~): ${periodPhrase}`)
   if (dur) pieces.push(`duur: ${dur} dagen`)
+  else if (durationPhrase) pieces.push(`duur (~): ${durationPhrase}`)
   if (acts.adds.length) pieces.push(`activiteiten: ${acts.adds.join(", ")}`)
   if (acts.removes.length) pieces.push(`(zonder: ${acts.removes.join(", ")})`)
 
@@ -250,20 +223,21 @@ function nlu(t: string, prev: Ctx): NLUHints {
     lang,
     country: c ?? prev.destination?.country ?? null,
     durationDays: dur ?? prev.durationDays ?? null,
+    durationPhrase: durationPhrase ?? null,
+    periodPhrase: periodPhrase ?? null,
     startDate: per.startDate ?? prev.startDate ?? null,
     endDate: per.endDate ?? prev.endDate ?? null,
     month: per.month ?? prev.month ?? null,
     activitiesAdd: acts.adds,
     activitiesRemove: acts.removes,
     confidence: score,
-    paraphrase
+    paraphrase,
+    policy: { allowApproximate: true, preferLLMInference: true }
   }
 }
 
-/* ---------- UI helpers from your original file (trimmed & reused) ---------- */
-function escapeHtml(s: string) {
-  return s.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;")
-}
+/* ---------- UI helpers (compact) ---------- */
+function escapeHtml(s: string) { return s.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;") }
 function inlineMd(s: string) {
   let out = s
   out = out.replace(/`([^`]+)`/g, (_m, c) => `<code class="ai-inline-code">${escapeHtml(c)}</code>`)
@@ -273,8 +247,7 @@ function inlineMd(s: string) {
   return out
 }
 function formatToChatUI(raw: string) {
-  const lines = raw.trim().split("\n")
-  const out: string[] = []
+  const lines = raw.trim().split("\n"); const out: string[] = []
   for (const line of lines) out.push(`<p>${inlineMd(line)}</p>`)
   return `<div class="ai-rich">${out.join("")}</div>`
 }
@@ -284,8 +257,7 @@ function deepMerge<T>(target: T, source: any): T {
   if (source === null || typeof source !== "object") return target
   const out: any = Array.isArray(target) ? [...(target as any)] : { ...(target as any) }
   for (const k of Object.keys(source)) {
-    const sv = (source as any)[k]
-    const tv = (out as any)[k]
+    const sv = (source as any)[k]; const tv = (out as any)[k]
     if (sv && typeof sv === "object" && !Array.isArray(sv)) out[k] = deepMerge(tv ?? {}, sv)
     else if (sv !== null && sv !== undefined) out[k] = sv
   }
@@ -308,13 +280,11 @@ async function* sseLines(reader: ReadableStreamDefaultReader<Uint8Array>) {
   const decoder = new TextDecoder("utf-8")
   let buffer = ""
   while (true) {
-    const { value, done } = await reader.read()
-    if (done) break
+    const { value, done } = await reader.read(); if (done) break
     buffer += decoder.decode(value, { stream: true })
     let idx: number
     while ((idx = buffer.indexOf("\n\n")) >= 0) {
-      const raw = buffer.slice(0, idx).trimEnd()
-      buffer = buffer.slice(idx + 2)
+      const raw = buffer.slice(0, idx).trimEnd(); buffer = buffer.slice(idx + 2)
       if (raw.length) yield raw
     }
   }
@@ -336,7 +306,7 @@ export default function PacklistAssistant({ showHint = true }: { showHint?: bool
   const [selected, setSelected] = React.useState<Record<string, boolean>>({})
   const abortRef = React.useRef<AbortController | null>(null)
 
-  // Dedupe & control where questions come from
+  // Dedupe & vraagbron‑controle
   const [lastAskKey, setLastAskKey] = React.useState<string | null>(null)
   const [backendAskMode, setBackendAskMode] = React.useState<boolean>(false)
 
@@ -374,8 +344,7 @@ export default function PacklistAssistant({ showHint = true }: { showHint?: bool
   }
 
   function nextQuestion(ctx = context): string | null {
-    const miss = missingSlots(ctx)
-    const order = ASK_ORDER.find(k => miss.includes(k as StepId))
+    const miss = missingSlots(ctx); const order = ASK_ORDER.find(k => miss.includes(k as StepId))
     if (!order) return null
     return {
       countries: "Waar ga je naartoe (land/landen)?",
@@ -387,11 +356,10 @@ export default function PacklistAssistant({ showHint = true }: { showHint?: bool
 
   function askOnce(key: string, text: string) {
     if (lastAskKey === key) return
-    setLastAskKey(key)
-    pushAssistantText(text)
+    setLastAskKey(key); pushAssistantText(text)
   }
 
-  /* ---------- Backend trigger with nluHints ---------- */
+  /* ---------- Backend trigger ---------- */
   async function sendToBackend(message: string, nluHints: NLUHints, history: any[]) {
     setRunning(true); setThinking(true)
     try {
@@ -407,19 +375,15 @@ export default function PacklistAssistant({ showHint = true }: { showHint?: bool
       let streamedText = ""; let hasStarted = false
       const reader = res.body.getReader()
       for await (const chunk of sseLines(reader)) {
-        let ev: string | null = null
-        let dataRaw = ""
+        let ev: string | null = null; let dataRaw = ""
         for (const line of chunk.split("\n")) {
           if (line.startsWith("event:")) ev = line.slice(6).trim()
           else if (line.startsWith("data:")) dataRaw += line.slice(5)
         }
         if (ev === "ask") {
-          // Prefer backend follow-up questions; suppress local ones to avoid duplicates
           setBackendAskMode(true)
-          try {
-            const payload = JSON.parse(dataRaw) as { question?: string }
-            const q = payload?.question?.trim()
-            if (q) askOnce(`ask:${q}`, q)
+          try { const payload = JSON.parse(dataRaw) as { question?: string }
+            const q = payload?.question?.trim(); if (q) askOnce(`ask:${q}`, q)
           } catch {}
         } else if (ev === "needs") {
           try { const payload = JSON.parse(dataRaw) as ContextPayload
@@ -439,40 +403,7 @@ export default function PacklistAssistant({ showHint = true }: { showHint?: bool
         } else if (ev === "products") {
           try { const incoming = (JSON.parse(dataRaw) as ProductsEvent) || []
             setProducts(prev => {
-              const seen = new Set<string>()
-              const out: Product[] = []
-              for (const p of [...(prev||[]), ...incoming]) {
-                const key = `${(p.name||"")}|${(p.url||"")}`.toLowerCase()
-                if (!seen.has(key) && !/(\.csv($|\?)|docs.google.com\/spreadsheets|export=download&format=csv)/.test((p.url||"").toLowerCase())) { seen.add(key); out.push(p) }
-              }
-              return out
-            })
-          } catch {}
-        } else if (ev === "error") {
-          try { setError((JSON.parse(dataRaw) as any)?.message || "Onbekende fout uit stream") } catch { setError(dataRaw || "Onbekende fout uit stream") }
-          break
-        } else if (ev === "done") { break }
-      }
-        if (ev === "needs") {
-          try { const payload = JSON.parse(dataRaw) as ContextPayload
-            const { season, seasonalRisks, adviceFlags, itemTags, ...rest } = payload || {}
-            if (Object.keys(rest).length) setContext(c => deepMerge(c, rest))
-          } catch {}
-        } else if (ev === "start") {
-          hasStarted = true; streamedText = ""; pushAssistantHTML(formatToChatUI(""))
-        } else if (ev === "delta" && hasStarted) {
-          let add = ""; try { const maybe = JSON.parse(dataRaw); add = typeof maybe === "string" ? maybe : (maybe as any)?.text ?? dataRaw } catch { add = dataRaw }
-          streamedText += add
-          setMessages(msgs => {
-            const copy = [...msgs]
-            for (let i = copy.length - 1; i >= 0; i--) if (copy[i].role === "assistant" && "html" in copy[i]) { copy[i] = { role: "assistant", html: formatToChatUI(streamedText) }; break }
-            return copy
-          })
-        } else if (ev === "products") {
-          try { const incoming = (JSON.parse(dataRaw) as ProductsEvent) || []
-            setProducts(prev => {
-              const seen = new Set<string>()
-              const out: Product[] = []
+              const seen = new Set<string>(); const out: Product[] = []
               for (const p of [...(prev||[]), ...incoming]) {
                 const key = `${(p.name||"")}|${(p.url||"")}`.toLowerCase()
                 if (!seen.has(key) && !/(\.csv($|\?)|docs.google.com\/spreadsheets|export=download&format=csv)/.test((p.url||"").toLowerCase())) { seen.add(key); out.push(p) }
@@ -500,14 +431,13 @@ export default function PacklistAssistant({ showHint = true }: { showHint?: bool
   function handleUserSend(message: string) {
     if (!message.trim() || running) return
     setMessages(m => [...m, { role: "user", text: message }])
-    setInput("")
-    resetTurnSideEffects()
+    setInput(""); resetTurnSideEffects()
 
-    // NLU pass (lightweight). We let the LLM interpolate/understand vague phrasing.
+    // NLU: lichtgewicht hints + expliciete policy om te interpoleren
     const hints = nlu(message, context)
     const intent = detectIntent(message)
 
-    // Optimistic local context updates (non-destructive)
+    // Optimistische contextupdates (alleen als zeker)
     if (hints.country) setContext(c => deepMerge(c, { destination: { country: hints.country, region: null } }))
     if (hints.durationDays) setContext(c => deepMerge(c, { durationDays: hints.durationDays }))
     if (hints.month || hints.startDate) setContext(c => deepMerge(c, { month: hints.month ?? null, startDate: hints.startDate ?? null, endDate: hints.endDate ?? null }))
@@ -516,23 +446,21 @@ export default function PacklistAssistant({ showHint = true }: { showHint?: bool
       activities: Array.from(new Set([...(c.activities||[]).filter(a => !(hints.activitiesRemove||[]).includes(a)), ...(hints.activitiesAdd||[])]))
     }))
 
-    // Always stream to backend so the LLM can reason & interpolate.
     const history = buildHistory([...messages, { role: "user", text: message }])
-    const enrichedHints = { ...hints, policy: { allowApproximate: true, preferLLMInference: true } } as any
 
     if (intent === "update" && hints.paraphrase) {
       pushAssistantText(`${hints.paraphrase} Aangepast! Ik denk mee…`)
-      return sendToBackend("Update door gebruiker", enrichedHints, history)
+      return sendToBackend("Update door gebruiker", hints, history)
     }
 
-    // Give a short paraphrase but do NOT ask locally; let backend ask if needed
+    // ChatGPT‑achtig: korte parafrase en dan het LLM laten redeneren.
     if (hints.paraphrase) pushAssistantText(`${hints.paraphrase} Ik denk mee…`)
     else pushAssistantText("Ik denk mee…")
 
-    return sendToBackend(message, enrichedHints, history)
+    return sendToBackend(message, hints, history)
   }
 
-  /* ---------- UI (trimmed) ---------- */
+  /* ---------- UI ---------- */
   const theme = darkMode ? dark : light
   const chips = [
     { label: "Land", value: context.destination?.country || undefined, onEdit: () => setInput("Ik ga naar …") },
@@ -552,7 +480,7 @@ export default function PacklistAssistant({ showHint = true }: { showHint?: bool
         </label>
       </div>
 
-      {showHint && <div style={{ ...muted }}>Tip: typ vrijuit (bv. “45 dagen Vietnam van 5–12 juli, hiken & duiken”). Ik haal eruit wat ik kan en vraag alleen door wat nog ontbreekt.</div>}
+      {showHint && <div style={{ ...muted }}>Tip: typ vrijuit (bv. “45 dagen Vietnam, rond de jaarwisseling, hiken & duiken”). Ik haal eruit wat ik kan en vraag alleen door wat nog ontbreekt.</div>}
 
       {done < 4 && <div style={{ ...muted }}>Ik heb {done}/4 onderdelen ✔︎</div>}
 
@@ -591,7 +519,7 @@ export default function PacklistAssistant({ showHint = true }: { showHint?: bool
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={onKeyDown}
-          placeholder="Schrijf hier… bv. '45 dagen Vietnam 5–12 juli, hiken & duiken'"
+          placeholder="Schrijf hier… bv. 'paar maanden Vietnam rond de jaarwisseling'"
           style={{ ...inputStyle, background: theme.inputBg, color: theme.text, borderColor: theme.border }}
           disabled={running}
         />
@@ -604,11 +532,9 @@ export default function PacklistAssistant({ showHint = true }: { showHint?: bool
         {products?.length ? (
           <ul style={productsGrid}>
             {products.map((p, i) => {
-              const key = productKey(p, i)
-              const isSelected = !!selected[key]
+              const key = productKey(p, i); const isSelected = !!selected[key]
               const card: React.CSSProperties = {
-                ...productCard,
-                position: "relative",
+                ...productCard, position: "relative",
                 borderColor: isSelected ? SELECTED.border : theme.border,
                 background: isSelected ? SELECTED.bg : theme.cardBg,
                 color: isSelected ? "#ffffff" : theme.text,
@@ -638,23 +564,5 @@ export default function PacklistAssistant({ showHint = true }: { showHint?: bool
   )
 }
 
-/* ---------- Theme & styles (same as your original) ---------- */
-const light = { bg: "white", text: "#0b0f19", border: "rgba(0,0,0,0.12)", inputBg: "white", buttonBg: "black", buttonText: "white", outputBg: "rgba(0,0,0,0.02)", link: "#111827", errorBg: "rgba(239,68,68,.08)", errorText: "#7f1d1d", errorBorder: "rgba(239,68,68,.35)", cardBg: "#ffffff" }
-const dark = { bg: "#0f1117", text: "#f3f4f6", border: "rgba(255,255,255,0.15)", inputBg: "#1a1c23", buttonBg: "#f3f4f6", buttonText: "#0f1117", outputBg: "#1a1c23", link: "#93c5fd", errorBg: "rgba(239,68,68,.15)", errorText: "#fee2e2", errorBorder: "rgba(239,68,68,.35)", cardBg: "#171a23" }
-
-const container: React.CSSProperties = { fontFamily: "Poppins, Inter, system-ui, -apple-system, Segoe UI, Roboto, sans-serif", display: "grid", gap: 14, padding: 16, width: "100%", boxSizing: "border-box", maxWidth: 720, margin: "0 auto", transition: "background 0.3s, color 0.3s" }
-const inputStyle: React.CSSProperties = { height: 36, padding: "0 12px", borderRadius: 10, border: "1px solid", outline: "none", fontSize: 14, width: "100%" }
-const btnBase: React.CSSProperties = { height: 36, padding: "0 14px", borderRadius: 10, border: "1px solid transparent", fontSize: 14, cursor: "pointer" }
-const btnPrimary: React.CSSProperties = { ...btnBase }
-const btnDanger: React.CSSProperties = { ...btnBase, background: "#ef4444", color: "white" }
-const sectionTitle: React.CSSProperties = { fontWeight: 600 }
-const chatScroll = (theme: any): React.CSSProperties => ({ border: "1px solid", borderColor: theme.border, borderRadius: 16, padding: 12, maxHeight: 520, minHeight: 200, overflowY: "auto", background: theme.outputBg })
-const bubbleBase: React.CSSProperties = { borderRadius: 14, padding: "8px 12px", margin: "6px 0", maxWidth: "84%", lineHeight: 1.6, wordBreak: "break-word" }
-const bubbleUser = (theme: any): React.CSSProperties => ({ background: theme.buttonBg, color: theme.buttonText })
-const bubbleAssistant = (_theme: any): React.CSSProperties => ({ background: "rgba(0,0,0,.04)" })
-const productsGrid: React.CSSProperties = { listStyle: "none", padding: 0, margin: 0, display: "grid", gap: 10, gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))" }
-const productCard: React.CSSProperties = { border: "1px solid", borderRadius: 12, padding: 12, display: "grid", gap: 6, minHeight: 96, overflow: "hidden" }
-const muted: React.CSSProperties = { fontSize: 12, opacity: 0.8 }
-const link: React.CSSProperties = { fontSize: 12, textDecoration: "underline" }
-const errorBox: React.CSSProperties = { padding: 10, borderRadius: 10, border: "1px solid" }
-const SELECTED = { bg: "#22c55e", border: "#16a34a" }
+/* ---------- Theme & styles ---------- */
+const light = { bg: "white", text: "#0b0f19", border: "rgba(0,0,0,0.12)", inputBg: "white", buttonBg: "black", buttonText: "white", outputBg: "rgba(0,0,0,0.02)", link: "#111827", errorBg: "rgba(239,68,68,.08)", errorText: "#7f1d1d", errorBo
