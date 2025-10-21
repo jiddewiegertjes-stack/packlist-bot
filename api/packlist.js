@@ -1,25 +1,14 @@
-// app/api/packlist/route.js
 export const runtime = "edge";
 
 /**
  * Packlist SSE + Slot-Filling Chat Backend (Edge)
- * - CORS/OPTIONS
- * - Hybride slot-extractie (regex + optionele LLM-verrijking)
- * - needs.contextOut stuurt ALLEEN de delta (frontend deep-merge)
- * - CSV-producten uit /public/pack_products.csv of env PRODUCTS_CSV_URL (Google Sheets Raw/Export)
- * - Debugregel voor CSV/filters + batching + graceful fallback
- *
- * +++ Toegevoegd in deze versie +++
- * - Seasons CSV integratie via SEASONS_CSV_URL
- * - computeSeasonInfoForContext(context, seasonsTable) → { season, seasonalRisks, adviceFlags, itemTags }
- * - Mergen van LLM-derived context met seasons-CSV context in de twee `send("context", ...)` momenten
- * - Prompt-injectie: seizoenscontext als extra systemregel voor de LLM
- * - Bugfix: followupQuestion gebruikte per ongeluk `ctx`
- *
- * +++ NIEUW (chat-achtig) +++
- * - Ondersteuning voor `history` (volledige chatgesprek) in de request body.
- * - `generateAndStream` en `streamOpenAI` kunnen nu óf een enkel `prompt` óf een `messages`-array gebruiken.
- * - `sanitizeHistory` beschermt tegen foutieve rollen/format en limiteert lengte.
+ * ------------------------------------------------
+ * Deze versie laat het LLM *ChatGPT‑achtiger* gedragen:
+ * - Neemt `history` én `nluHints` aan vanuit de frontend.
+ * - Geeft het model expliciete toestemming om vage taal te interpreteren
+ *   (bv. "paar maanden", "rond de jaarwisseling").
+ * - Doorbreekt de `ask`-loop zodra er voldoende signaal is (duration/period).
+ * - Injecteert seizoenscontext als extra systemregel.
  */
 
 const OPENAI_API_BASE = "https://api.openai.com/v1";
@@ -109,32 +98,44 @@ export async function POST(req) {
 
       const safeContext = normalizeContext(body?.context);
       const message = (body?.message || "").trim();
-      const hasDirectPrompt =
-        typeof body?.prompt === "string" && body.prompt.trim().length > 0;
+      const hasDirectPrompt = typeof body?.prompt === "string" && body.prompt.trim().length > 0;
 
-      // ✨ NIEUW: optionele conversatiegeschiedenis van de frontend
+      // Conversatiegeschiedenis en hints uit de frontend
       const history = sanitizeHistory(body?.history);
+      const nluHints = body?.nluHints || null; // <— NIEUW
 
       try {
-        // Vrije-tekst (slot-filling)
+        // Vrije tekst pad (slot-filling)
         if (!hasDirectPrompt && message) {
           const extracted = await extractSlots({ utterance: message, context: safeContext });
-          mergeInto(safeContext, extracted?.context || {}); // server-side context bijwerken
+          mergeInto(safeContext, extracted?.context || {});
           const missing = missingSlots(safeContext);
 
-          if (missing.length > 0) {
-            const followupQ = followupQuestion({ missing, context: safeContext });
+          // Kijk of er taalsignaal is waardoor we níet hoeven te vragen
+          const userLower = message.toLowerCase();
+          const hasDurationSignal =
+            !!nluHints?.durationDays ||
+            !!nluHints?.durationPhrase ||
+            /\b(weekje|maandje|paar\s*weken|paar\s*maanden)\b/.test(userLower);
+          const hasPeriodSignal =
+            !!nluHints?.month ||
+            !!nluHints?.startDate ||
+            !!nluHints?.periodPhrase ||
+            /\brond\s+de\s+jaarwisseling|rond\s+kerst|oud.*nieuw\b/.test(userLower);
 
-            // ⬇️ stuur ALLEEN de delta terug (frontend deep-merge beschermt bestaande waarden)
-            send("needs", { missing, contextOut: extracted?.context || {} });
+          const stillMissing = missing.filter((m) =>
+            (m === "durationDays" && !hasDurationSignal) ||
+            (m === "period" && !hasPeriodSignal) ||
+            (m === "destination.country")
+          );
 
-            // seasons + derived samensturen (frontend toont b.v. seizoenhint)
+          if (stillMissing.length > 0) {
+            const followupQ = followupQuestion({ missing: stillMissing, context: safeContext });
+            send("needs", { missing: stillMissing, contextOut: extracted?.context || {} });
             const derived = await derivedContext(safeContext);
             const seasonsCtx = await seasonsContextFor(safeContext);
-
-            send("ask", { question: followupQ, missing });
+            send("ask", { question: followupQ, missing: stillMissing });
             send("context", { ...derived, ...seasonsCtx });
-
             controller.close();
             return;
           }
@@ -145,8 +146,9 @@ export async function POST(req) {
             req,
             prompt: buildPromptFromContext(safeContext),
             context: safeContext,
-            history, // ✨ meegeven
-            lastUserMessage: message, // ✨ zodat model weet wat er net gezegd is
+            history,
+            lastUserMessage: message,
+            nluHints, // <— meegeven
           });
           return;
         }
@@ -159,16 +161,14 @@ export async function POST(req) {
           const followupQ = followupQuestion({ missing, context: safeContext });
           const derived = await derivedContext(safeContext);
           const seasonsCtx = await seasonsContextFor(safeContext);
-
           send("needs", { missing, contextOut: {} });
           send("ask", { question: followupQ, missing });
           send("context", { ...derived, ...seasonsCtx });
-
           controller.close();
           return;
         }
 
-        await generateAndStream({ controller, send, req, prompt, context: safeContext, history });
+        await generateAndStream({ controller, send, req, prompt, context: safeContext, history, nluHints });
       } catch (e) {
         closeWithError(e?.message || "Onbekende fout");
       }
@@ -265,7 +265,7 @@ async function extractSlots({ utterance, context }) {
   else if (dWks) baseline.context.durationDays = Number(dWks[1]) * 7;
 
   // Datumbereik (optioneel)
-  const dateRange = m.match(/(\d{1,2})[-/.](\d{1,2})[-/.](\d{2,4}).{0,30}?(\d{1,2})[-/.](\d{1,2})[-/.](\d{2,4})/);
+  const dateRange = m.match(/(\d{1,2})[-\/.](\d{1,2})[-\/.](\d{2,4}).{0,30}?(\d{1,2})[-\/.](\d{1,2})[-\/.](\d{2,4})/);
   if (dateRange) {
     const [, d1, mo1, y1, d2, mo2, y2] = dateRange;
     baseline.context.startDate = toISO(y1, mo1, d1);
@@ -327,7 +327,7 @@ function followupQuestion({ missing, context }) {
   if (context?.month) pref.push(`maand: ${context.month}`);
   if (context?.startDate && context?.endDate) pref.push(`data: ${context.startDate} t/m ${context.endDate}`);
   const hint = pref.length ? ` (bekend: ${pref.join(", ")})` : "";
-  return `Kun je nog aangeven: ${labels.join(", ")}?${hint}`;
+  return `Kun je nog aangeven: ${labels.join(", " )}?${hint}`;
 }
 
 /* -------------------- Afgeleide context (LLM) -------------------- */
@@ -341,10 +341,7 @@ async function derivedContext(ctx) {
   return json;
 }
 
-/* -------------------- Seasons CSV integratie (NIEUW) -------------------- */
-/** Verwacht kolommen (enriched):
- * country,region,type,label,level,start_month,end_month,advice_flags,item_tags,note
- */
+/* -------------------- Seasons CSV integratie -------------------- */
 const SEASONS_CSV_URL = (process.env.SEASONS_CSV_URL || "").trim();
 const SEASONS_TTL_MS = 6 * 60 * 60 * 1000; // 6 uur
 const MONTHS_EN = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
@@ -373,7 +370,7 @@ async function loadSeasonsTable() {
   const res = await fetch(SEASONS_CSV_URL, { cache: "no-store" });
   if (!res.ok) return [];
   const text = await res.text();
-  const rows = parseCsv(text); // hergebruik bestaande CSV-parser
+  const rows = parseCsv(text);
   __SEASONS_CACHE__ = { rows, at: Date.now() };
   return rows;
 }
@@ -477,26 +474,23 @@ function seasonPromptLines(seasonsCtx) {
 
 /* -------------------- Generate & Stream -------------------- */
 
-async function generateAndStream({ controller, send, req, prompt, context, history, lastUserMessage }) {
+async function generateAndStream({ controller, send, req, prompt, context, history, lastUserMessage, nluHints }) {
   const derived = await derivedContext(context);
   const seasonsCtx = await seasonsContextFor(context);
 
-  // samen versturen (frontend hint + eventuele extra velden)
   send("context", { ...derived, ...seasonsCtx });
 
-  // Bouw systemExtras met seizoensregels zodat de LLM het ook echt gebruikt
   const systemExtras = seasonPromptLines(seasonsCtx);
 
   send("start", {});
   try {
-    // ✨ Als history is aangeleverd: gebruik volledige conversatie
-    // Anders: val terug op één enkele user-prompt (oude gedrag).
     const messages = buildMessagesForOpenAI({
       systemExtras,
       prompt,
       history,
       contextSummary: summarizeContext(context),
       lastUserMessage,
+      nluHints, // <— meegeven
     });
 
     await streamOpenAI({
@@ -518,7 +512,6 @@ async function generateAndStream({ controller, send, req, prompt, context, histo
       }
     }
   } catch (e) {
-    // Laat de reden zien in UI:
     send("products", [{
       category: "DEBUG",
       name: `products error: ${(e && e.message) || "unknown"}`,
@@ -530,7 +523,6 @@ async function generateAndStream({ controller, send, req, prompt, context, histo
     }]);
   }
 
-  // nogmaals context terugsturen (zoals je deed), nu ook met seasons
   send("context", { ...derived, ...seasonsCtx });
   send("done", {});
   controller.close();
@@ -550,37 +542,37 @@ function summarizeContext(ctx) {
 }
 
 /* ---------- Bouw OpenAI messages ---------- */
-function buildMessagesForOpenAI({ systemExtras = [], prompt, history, contextSummary, lastUserMessage }) {
+function buildMessagesForOpenAI({ systemExtras = [], prompt, history, contextSummary, lastUserMessage, nluHints }) {
   const baseSystem = {
     role: "system",
     content:
       "Je schrijft compacte, praktische paklijsten in het Nederlands. Gebruik secties: Korte samenvatting, Kleding, Gear, Gadgets, Health, Tips. Geen disclaimers.",
   };
 
-  const extras = (systemExtras || []).map((m) => ({ role: "system", content: m.content || m }));
+  const approxSystem = (nluHints?.policy?.allowApproximate || nluHints?.durationPhrase || nluHints?.periodPhrase)
+    ? [{
+        role: "system",
+        content:
+          "Je mag vage tijdsaanduidingen taalkundig interpreteren. Voorbeelden: 'paar maanden' ≈ 2–3 maanden (neem 3 bij twijfel), 'rond de jaarwisseling' ≈ 20 dec–10 jan. " +
+          "Als er voldoende signaal is in de laatste userboodschap of history, vul ontbrekende velden in zonder opnieuw te vragen; vraag alleen door bij echte ambiguïteit.",
+      }]
+    : [];
 
+  const extras = (systemExtras || []).map((m) => ({ role: "system", content: m.content || m }));
   const ctxMsg = contextSummary ? [{ role: "system", content: contextSummary }] : [];
 
   if (history && history.length) {
-    // Gebruik aangeleverde conversatie en sluit af met de laatste userboodschap (indien apart meegegeven)
     const hist = history.map((m) => ({ role: m.role, content: String(m.content || "").slice(0, 8000) }));
     const tail = lastUserMessage ? [{ role: "user", content: String(lastUserMessage).slice(0, 8000) }] : [];
-    return [...extras, baseSystem, ...ctxMsg, ...hist, ...tail];
+    return [...approxSystem, ...extras, baseSystem, ...ctxMsg, ...hist, ...tail];
   }
 
-  // Back-compat: geen history → enkel prompt als user
-  return [...extras, baseSystem, ...ctxMsg, { role: "user", content: prompt }];
+  return [...approxSystem, ...extras, baseSystem, ...ctxMsg, { role: "user", content: prompt }];
 }
 
 /* -------------------- CSV producten -------------------- */
-/**
- * CSV in /public/pack_products.csv OF env PRODUCTS_CSV_URL (absolute URL, bv. Google Sheets export)
- * Headers: category,name,weight_grams,activities,seasons,url,image
- */
-
 const CSV_PUBLIC_PATH = "/pack_products.csv"; // fallback-pad
 
-// Runtime ENV-resolver (niet op top-level cachen!)
 function resolveCsvUrl(origin) {
   const url = (process.env.PRODUCTS_CSV_URL && String(process.env.PRODUCTS_CSV_URL).trim()) || "";
   return url || new URL(CSV_PUBLIC_PATH, origin).toString();
@@ -597,7 +589,6 @@ async function productsFromCSV(ctx, req) {
   const origin = new URL(req.url).origin;
   const resolvedUrl = resolveCsvUrl(origin);
 
-  // laad CSV (met fout als debugproduct)
   let rows;
   try {
     rows = await loadCsvOnce(origin);
@@ -625,8 +616,8 @@ async function productsFromCSV(ctx, req) {
     const prodSeasons = splitCsvList(r.seasons);
 
     const actsOk =
-      prodActs.length === 0 ||                 // general item
-      acts.some((a) => prodActs.includes(a));  // overlap
+      prodActs.length === 0 ||
+      acts.some((a) => prodActs.includes(a));
 
     const seasonOk =
       prodSeasons.length === 0 ||
@@ -637,7 +628,6 @@ async function productsFromCSV(ctx, req) {
     return actsOk && seasonOk;
   });
 
-  // fallback: neem algemene items (leeg/alle) als de filter niets vindt
   let outRows = filtered;
   if (outRows.length === 0) {
     outRows = rows.filter((r) => {
@@ -647,7 +637,6 @@ async function productsFromCSV(ctx, req) {
     });
   }
 
-  // Debugregel bovenaan zodat je meteen ziet of de bron/filters kloppen
   const debugItem = {
     category: "DEBUG",
     name: `csv=${resolvedUrl} | total=${rows.length} | filtered=${filtered.length} | out=${outRows.length}`,
@@ -751,7 +740,6 @@ function splitCsvLine(line) {
 
 /* -------------------- OpenAI helpers -------------------- */
 
-// ✨ NIEUW: veilige history-acceptatie
 function sanitizeHistory(raw) {
   if (!Array.isArray(raw)) return null;
   const ok = [];
@@ -759,9 +747,9 @@ function sanitizeHistory(raw) {
     const role = (m && m.role) || "";
     const content = (m && m.content) || "";
     if (!content) continue;
-    if (role !== "user" && role !== "assistant") continue; // alleen deze 2 rollen toestaan
+    if (role !== "user" && role !== "assistant") continue;
     ok.push({ role, content: String(content).slice(0, 8000) });
-    if (ok.length >= 24) break; // limiter
+    if (ok.length >= 24) break;
   }
   return ok.length ? ok : null;
 }
@@ -817,7 +805,6 @@ async function safeErrorText(res) {
   try { return (await res.text())?.slice(0, 400); } catch { return ""; }
 }
 
-// ✨ VERNIEUWD: accepteert nu 'messages' (history + prompt) i.p.v. alleen 'prompt'
 async function streamOpenAI({ messages, onDelta }) {
   if (!Array.isArray(messages) || messages.length === 0) {
     throw new Error("Missing messages for OpenAI");
