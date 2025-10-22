@@ -1,6 +1,15 @@
 // app/api/packlist/route.js
 import { NextResponse } from "next/server"
 
+// === CORS ===
+// Wil je strakker afschermen? Zet ALLOWED_ORIGIN op bv. "https://trekvice.com"
+const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*"
+const CORS_HEADERS = {
+  "Access-Control-Allow-Origin": ALLOWED_ORIGIN,
+  "Access-Control-Allow-Headers": "Content-Type, Authorization",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+}
+
 // Kleine util om SSE te sturen
 function sseWrite(writer, event, data) {
   const enc = typeof data === "string" ? data : JSON.stringify(data)
@@ -9,7 +18,6 @@ function sseWrite(writer, event, data) {
 }
 
 function pickSeasonHint(ctx = {}) {
-  // Neutraal advies als periode onbekend
   if (ctx?.unknownPeriod || (!ctx?.month && !ctx?.startDate)) {
     return {
       season: "all-season",
@@ -31,17 +39,14 @@ function computeMissing(context = {}) {
   const uPeriod = !!context.unknownPeriod
   const uDuration = !!context.unknownDuration
 
-  // Land
   if (!uCountry) {
     const hasCountry = !!(destination && destination.country)
     if (!hasCountry) missing.push({ field: "countries", question: "Naar welk(e) land(en) ga je?" })
   }
-  // Periode
   if (!uPeriod) {
     const hasPeriod = !!(month || startDate || endDate)
     if (!hasPeriod) missing.push({ field: "period", question: "Wanneer ongeveer ga je op reis?" })
   }
-  // Duur
   if (!uDuration) {
     const hasDur = Number.isFinite(Number(durationDays)) && durationDays > 0
     if (!hasDur) missing.push({ field: "duration", question: "Hoe lang ben je ongeveer weg?" })
@@ -50,8 +55,7 @@ function computeMissing(context = {}) {
 }
 
 function basePacklist(context = {}) {
-  // Generieke basis bij onbepaalde info
-  const generic = [
+  return [
     { category: "Kleding", name: "T-shirt (merino/synthetisch)", weight_grams: 150 },
     { category: "Kleding", name: "Lichte trui / midlayer", weight_grams: 300 },
     { category: "Kleding", name: "Regenjas (shell)", weight_grams: 280 },
@@ -59,15 +63,18 @@ function basePacklist(context = {}) {
     { category: "Gadgets", name: "Universele stekker + usb-lader", weight_grams: 120 },
     { category: "Health", name: "EHBO-kitje compact", weight_grams: 90 },
   ]
-  return generic
 }
 
-// Event stream response
+// ---- CORS preflight ----
+export async function OPTIONS() {
+  return new NextResponse(null, { status: 204, headers: CORS_HEADERS })
+}
+
+// ---- Event stream POST ----
 export async function POST(req) {
   try {
     const { message, context: incomingContext = {}, nluHints = {}, history = [] } = await req.json()
 
-    // Combineer context en hints (hints overschrijven niet-bestaande velden)
     const context = {
       ...incomingContext,
       unknownCountry: !!(incomingContext.unknownCountry || nluHints.unknownCountry),
@@ -93,22 +100,21 @@ export async function POST(req) {
           close: () => controller.close(),
         }
 
-        // 1) Context/meta pushen
+        // 1) Context/meta
         const meta = pickSeasonHint(context)
         sseWrite(writer, "context", meta)
 
-        // 2) Needs/missing (respecteer unknown* → sla die velden over)
+        // 2) Needs/missing (respecteer unknown*)
         const missing = computeMissing(context)
-
         if (missing.length) {
-          // Stuur needs (bijv. om context te syncen)
           sseWrite(writer, "needs", { missing: missing.map((m) => m.field), contextOut: {} })
-          // Vraag hoogstens één gerichte vervolgvraag (geen spam)
           const first = missing[0]
           sseWrite(writer, "ask", { field: first.field, question: first.question })
+        } else {
+          sseWrite(writer, "needs", { missing: [], contextOut: {} })
         }
 
-        // 3) Start content streaming
+        // 3) Start streaming body
         sseWrite(writer, "start", { ok: true })
 
         const countryTxt = context?.destination?.country
@@ -128,19 +134,12 @@ export async function POST(req) {
         const opening =
           `**Korte samenvatting**\n\n` +
           `- We starten met een flexibele basis-packlist.\n` +
-          (context.unknownCountry || !context?.destination?.country
-            ? "- Land nog open → kies all-season basics.\n"
-            : "") +
-          (context.unknownPeriod || (!context.month && !context.startDate)
-            ? "- Periode nog open → laagjes + regenbescherming.\n"
-            : "") +
-          (context.unknownDuration || !context.durationDays
-            ? "- Duur nog open → focus op wasbaar & multifunctioneel.\n"
-            : "")
+          (context.unknownCountry || !context?.destination?.country ? "- Land nog open → all-season basics.\n" : "") +
+          (context.unknownPeriod || (!context.month && !context.startDate) ? "- Periode nog open → laagjes + regenbescherming.\n" : "") +
+          (context.unknownDuration || !context.durationDays ? "- Duur nog open → focus op wasbaar & multifunctioneel.\n" : "")
 
         sseWrite(writer, "delta", opening + "\n")
 
-        // 4) Optioneel OpenAI voor een mooie tekst (als key aanwezig)
         const useOpenAI = !!process.env.OPENAI_API_KEY
         const seedText =
           `${countryTxt}${whenTxt}${durTxt}\n` +
@@ -148,20 +147,15 @@ export async function POST(req) {
           `**Gear** - compacte rugzak, regenhoes, packing cubes.\n` +
           `**Gadgets** - powerbank, wereldstekker, kabels.\n` +
           `**Health** - pleisters, pijnstiller, ORS.\n` +
-          `**Tips** - reisverzekering check, kopieën van documenten, pin+cash.\n`
+          `**Tips** - verzekering check, kopieën documenten, pin+cash.\n`
 
         const finish = async () => {
-          // 5) Suggesties pushen
-          const products = basePacklist(context)
-          sseWrite(writer, "products", products)
-
-          // 6) Done
+          sseWrite(writer, "products", basePacklist(context))
           sseWrite(writer, "done", { ok: true })
           writer.close()
         }
 
         const openAiFallback = async () => {
-          // Simpel fallback blok als OpenAI niet is geconfigureerd
           sseWrite(writer, "delta", seedText)
           await finish()
         }
@@ -199,24 +193,15 @@ export async function POST(req) {
             const json = await res.json()
             const text = json?.choices?.[0]?.message?.content || seedText
             sseWrite(writer, "delta", text)
-          } catch (e) {
-            // Fall back naar seed
+          } catch {
             sseWrite(writer, "delta", seedText)
           } finally {
             await finish()
           }
         }
 
-        // als er niets ontbreekt maar user tóch "onbepaald" heeft gezet, geen extra asks sturen
-        if (missing.length === 0) {
-          sseWrite(writer, "needs", { missing: [], contextOut: {} })
-        }
-
-        if (useOpenAI) {
-          openAiFancy()
-        } else {
-          openAiFallback()
-        }
+        if (useOpenAI) openAiFancy()
+        else openAiFallback()
       },
     })
 
@@ -226,12 +211,15 @@ export async function POST(req) {
         "Cache-Control": "no-cache, no-transform",
         Connection: "keep-alive",
         "X-Accel-Buffering": "no",
+        ...CORS_HEADERS, // << CORS headers on stream response
       },
     })
   } catch (err) {
     const msg = (err && err.message) || "Unknown server error"
-    return NextResponse.json({ error: msg }, { status: 500 })
+    return NextResponse.json({ error: msg }, { status: 500, headers: CORS_HEADERS })
   }
 }
 
+// Streaming werkt het stabielst op Node.js runtime op Vercel
 export const dynamic = "force-dynamic"
+export const runtime = "nodejs"
