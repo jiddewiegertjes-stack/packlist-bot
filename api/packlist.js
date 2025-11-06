@@ -3,14 +3,11 @@ export const runtime = "edge";
 /**
  * Packlist SSE + Slot-Filling Chat Backend (Edge)
  * ------------------------------------------------
- * Deze versie laat het LLM *ChatGPT-achtiger* gedragen:
- * - Neemt `history` én `nluHints` aan vanuit de frontend.
- * - Geeft het model expliciete toestemming om vage taal te interpreteren
- *   (bv. "paar maanden", "rond de jaarwisseling").
- * - Doorbreekt de `ask`-loop zodra er voldoende signaal is (duration/period).
- * - Injecteert seizoenscontext als extra systemregel.
- * - ✨ NIEUW: Prompt-policy om altijd te antwoorden (ook bij onbekend),
- *   niet door te vragen, en spelling/varianten te normaliseren.
+ * NL-code, maar output en gebruikers-IO worden geforceerd naar Engels.
+ * Wijzigingen:
+ * - forceEnglishSystem(): systemregel om ALTIJD in Engels te antwoorden.
+ * - baseSystem eerste regel: schrijft altijd in helder Engels.
+ * - extractSlots(): maanden + duur ondersteunen nu ook Engelse termen.
  */
 
 const OPENAI_API_BASE = "https://api.openai.com/v1";
@@ -104,7 +101,7 @@ export async function POST(req) {
 
       // Conversatiegeschiedenis en hints uit de frontend
       const history = sanitizeHistory(body?.history);
-      const nluHints = body?.nluHints || null; // <— hints (duur/maand/taalvarianten)
+      const nluHints = body?.nluHints || null;
 
       try {
         // Vrije tekst pad (slot-filling)
@@ -118,14 +115,13 @@ export async function POST(req) {
           const hasDurationSignal =
             !!nluHints?.durationDays ||
             !!nluHints?.durationPhrase ||
-            /\b(weekje|maandje|paar\s*weken|paar\s*maanden)\b/.test(userLower);
+            /\b(weekje|maandje|paar\s*weken|paar\s*maanden|few\s*weeks|few\s*months)\b/.test(userLower);
           const hasPeriodSignal =
             !!nluHints?.month ||
             !!nluHints?.startDate ||
             !!nluHints?.periodPhrase ||
             /\brond\s+de\s+jaarwisseling|rond\s+kerst|oud.*nieuw\b/.test(userLower);
 
-          // Alleen doorvragen als écht alles ontbreekt (land, duur én periode) en er geen enkel signaal is
           const HARD_MISS = ["destination.country", "durationDays", "period"];
           const allHardMissing = HARD_MISS.every(f => missing.includes(f));
           const hasAnySignal =
@@ -148,7 +144,7 @@ export async function POST(req) {
             return;
           }
 
-          // 👉 Anders: ALTIJD genereren, zelfs als 'period' of iets anders nog ontbreekt
+          // 👉 Anders: ALTIJD genereren
           await generateAndStream({
             controller,
             send,
@@ -157,7 +153,7 @@ export async function POST(req) {
             context: safeContext,
             history,
             lastUserMessage: message,
-            nluHints, // <— meegeven
+            nluHints,
           });
           return;
         }
@@ -166,7 +162,6 @@ export async function POST(req) {
         const prompt = hasDirectPrompt ? body.prompt.trim() : buildPromptFromContext(safeContext);
         const missing = missingSlots(safeContext);
 
-        // Zelfde policy: vraag alleen door als echt alles ontbreekt
         const HARD_MISS = ["destination.country", "durationDays", "period"];
         const allHardMissing = HARD_MISS.every(f => missing.includes(f));
         const hasAnySignal =
@@ -185,7 +180,6 @@ export async function POST(req) {
           return;
         }
 
-        // 👉 Anders: ALTIJD genereren
         await generateAndStream({ controller, send, req, prompt, context: safeContext, history, nluHints });
       } catch (e) {
         closeWithError(e?.message || "Onbekende fout");
@@ -238,13 +232,14 @@ function buildPromptFromContext(ctx) {
       ? ` Activiteiten: ${ctx.activities.join(", ")}.`
       : "";
   const days = ctx?.durationDays || "?";
+  // Prompt mag NL blijven; forceEnglishSystem zorgt voor Engelstalige output.
   return `Maak een backpack paklijst voor ${days} dagen naar ${where}, ${when}.${acts}`;
 }
 
 /* -------------------- Hybride slot-extractie -------------------- */
 
 async function extractSlots({ utterance, context }) {
-  // 1) Regex baseline (werkt zonder API-key)
+  // 1) Regex baseline
   const m = (utterance || "").toLowerCase().normalize("NFKD").replace(/[\u0300-\u036f]/g, "");
   const baseline = {
     context: {
@@ -258,7 +253,7 @@ async function extractSlots({ utterance, context }) {
     },
   };
 
-  // Landen
+  // Landen (kleine lijst — rest via LLM)
   const COUNTRY = [
     { re: /\bvietnam\b/,                 name: "Vietnam" },
     { re: /\bindonesie|indonesia\b/,     name: "Indonesië" },
@@ -271,18 +266,18 @@ async function extractSlots({ utterance, context }) {
   const hit = COUNTRY.find(c => c.re.test(m));
   if (hit) baseline.context.destination.country = hit.name;
 
-  // Maand
-  const MONTH = /(januari|februari|maart|april|mei|juni|juli|augustus|september|oktober|november|december)/;
+  // Maand (NL + EN)
+  const MONTH = /(januari|februari|maart|april|mei|juni|juli|augustus|september|oktober|november|december|january|february|march|april|may|june|july|august|september|october|november|december)/;
   const mm = m.match(MONTH);
   if (mm) baseline.context.month = mm[1];
 
-  // Duur
-  const dDays = m.match(/(\d{1,3})\s*(dagen|dag|dgn|d)\b/);
-  const dWks  = m.match(/(\d{1,2})\s*(weken|wk|w)\b/);
+  // Duur (NL + EN)
+  const dDays = m.match(/(\d{1,3})\s*(dagen|dag|dgn|days?|d)\b/);
+  const dWks  = m.match(/(\d{1,2})\s*(weken|weeks?|wk|w)\b/);
   if (dDays) baseline.context.durationDays = Number(dDays[1]);
   else if (dWks) baseline.context.durationDays = Number(dWks[1]) * 7;
 
-  // Datumbereik (optioneel)
+  // Datumbereik (optioneel, numeriek)
   const dateRange = m.match(/(\d{1,2})[-\/.](\d{1,2})[-\/.](\d{2,4}).{0,30}?(\d{1,2})[-\/.](\d{1,2})[-\/.](\d{2,4})/);
   if (dateRange) {
     const [, d1, mo1, y1, d2, mo2, y2] = dateRange;
@@ -293,8 +288,8 @@ async function extractSlots({ utterance, context }) {
   // Activiteiten
   const acts = [];
   if (/(duik|duiken|snorkel|scuba)/.test(m)) acts.push("duiken");
-  if (/(hike|hiken|trek|wandelen)/.test(m)) acts.push("hiken");
-  if (/(surf|surfen)/.test(m)) acts.push("surfen");
+  if (/(hike|hiken|trek|wandelen|hiking)/.test(m)) acts.push("hiken");
+  if (/(surf|surfen|surfing)/.test(m)) acts.push("surfen");
   if (/(city|stad|citytrip)/.test(m)) acts.push("citytrip");
   if (acts.length) baseline.context.activities = acts;
 
@@ -492,6 +487,17 @@ function seasonPromptLines(seasonsCtx) {
 
 /* -------------------- ✨ Prompt policy helpers -------------------- */
 
+/** Forceer: ALTIJD in het Engels antwoorden */
+function forceEnglishSystem() {
+  return {
+    role: "system",
+    content:
+      "You must always write your final answer in clear, natural English. " +
+      "Even if the user's message or the prompt is in another language (e.g., Dutch), reply in English only. " +
+      "Do not apologize for switching language; just answer in English with a concise, practical tone."
+  };
+}
+
 /** Forceer: ga door met antwoorden (ook bij onbekend), niet doorvragen, normaliseer varianten */
 function unknownPolicySystem(ctx, nluHints) {
   const unknowns = [];
@@ -529,7 +535,7 @@ async function generateAndStream({ controller, send, req, prompt, context, histo
       contextSummary: summarizeContext(context),
       lastUserMessage,
       nluHints,
-      _ctx: context // <— doorgeven voor unknownPolicySystem
+      _ctx: context
     });
 
     await streamOpenAI({
@@ -586,8 +592,8 @@ function buildMessagesForOpenAI({ systemExtras = [], prompt, history, contextSum
   const baseSystem = {
     role: "system",
     content: [
-      // Doel & taal
-      "Je bent een NL-assistent die compacte, praktische backpack-paklijsten maakt. Schrijf in helder Nederlands, direct en zonder disclaimers of excuses.",
+      // Doel & taal — NU ENGELS
+      "Je schrijft altijd in helder Engels, direct en zonder disclaimers of excuses.",
       // Structuur
       "Gebruik deze secties in onderstaande volgorde: Korte samenvatting, Kleding, Gear, Gadgets, Health, Tips.",
       "De eerste paragraaf is een verhalende, menselijke intro (2–4 zinnen) die de situatie van de gebruiker samenvat en aannames transparant benoemt.",
@@ -630,7 +636,7 @@ function buildMessagesForOpenAI({ systemExtras = [], prompt, history, contextSum
           "Vul ontbrekende velden in zonder door te vragen."
       }];
 
-  // Korte few-shot interpretaties om normalisatie te forceren
+  // Korte few-shot interpretaties
   const fewShot = [{
     role: "system",
     content: [
@@ -643,13 +649,16 @@ function buildMessagesForOpenAI({ systemExtras = [], prompt, history, contextSum
   const extras = (systemExtras || []).map((m) => ({ role: "system", content: m.content || m }));
   const ctxMsg = contextSummary ? [{ role: "system", content: contextSummary }] : [];
 
+  // ➕ Zet Engelse policy als eerste systeemregel
+  const english = [forceEnglishSystem()];
+
   if (history && history.length) {
     const hist = history.map((m) => ({ role: m.role, content: String(m.content || "").slice(0, 8000) }));
     const tail = lastUserMessage ? [{ role: "user", content: String(lastUserMessage).slice(0, 8000) }] : [];
-    return [policyUnknown, ...fewShot, ...approxSystem, ...extras, baseSystem, ...ctxMsg, ...hist, ...tail];
+    return [...english, policyUnknown, ...fewShot, ...approxSystem, ...extras, baseSystem, ...ctxMsg, ...hist, ...tail];
   }
 
-  return [policyUnknown, ...fewShot, ...approxSystem, ...extras, baseSystem, ...ctxMsg, { role: "user", content: prompt }];
+  return [...english, policyUnknown, ...fewShot, ...approxSystem, ...extras, baseSystem, ...ctxMsg, { role: "user", content: prompt }];
 }
 
 /* -------------------- CSV producten -------------------- */
