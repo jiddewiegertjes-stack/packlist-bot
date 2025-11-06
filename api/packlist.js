@@ -3,12 +3,14 @@ export const runtime = "edge";
 /**
  * Packlist SSE + Slot-Filling Chat Backend (Edge)
  * ------------------------------------------------
- * Deze versie laat het LLM *ChatGPT‑achtiger* gedragen:
+ * Deze versie laat het LLM *ChatGPT-achtiger* gedragen:
  * - Neemt `history` én `nluHints` aan vanuit de frontend.
  * - Geeft het model expliciete toestemming om vage taal te interpreteren
  *   (bv. "paar maanden", "rond de jaarwisseling").
  * - Doorbreekt de `ask`-loop zodra er voldoende signaal is (duration/period).
  * - Injecteert seizoenscontext als extra systemregel.
+ * - ✨ NIEUW: Prompt-policy om altijd te antwoorden (ook bij onbekend),
+ *   niet door te vragen, en spelling/varianten te normaliseren.
  */
 
 const OPENAI_API_BASE = "https://api.openai.com/v1";
@@ -102,7 +104,7 @@ export async function POST(req) {
 
       // Conversatiegeschiedenis en hints uit de frontend
       const history = sanitizeHistory(body?.history);
-      const nluHints = body?.nluHints || null; // <— NIEUW
+      const nluHints = body?.nluHints || null; // <— hints (duur/maand/taalvarianten)
 
       try {
         // Vrije tekst pad (slot-filling)
@@ -472,6 +474,26 @@ function seasonPromptLines(seasonsCtx) {
   ];
 }
 
+/* -------------------- ✨ Prompt policy helpers -------------------- */
+
+/** Forceer: ga door met antwoorden (ook bij onbekend), niet doorvragen, normaliseer varianten */
+function unknownPolicySystem(ctx, nluHints) {
+  const unknowns = [];
+  if (ctx?.unknownCountry) unknowns.push("land/bestemming");
+  if (ctx?.unknownPeriod) unknowns.push("periode (maand of data)");
+  if (ctx?.unknownDuration) unknowns.push("duur (aantal dagen)");
+  if (!ctx?.destination?.country && !unknowns.includes("land/bestemming")) unknowns.push("land/bestemming");
+  if (!ctx?.month && !(ctx?.startDate && ctx?.endDate) && !unknowns.includes("periode (maand of data)")) unknowns.push("periode (maand of data)");
+  if (!ctx?.durationDays && !unknowns.includes("duur (aantal dagen)")) unknowns.push("duur (aantal dagen)");
+
+  const lines = [
+    "Ga door met antwoorden, ook als onderstaande velden onbekend zijn.",
+    "Stel géén vervolgvraag; maak redelijke aannames en benoem ze kort in de tekst.",
+    unknowns.length ? `Onbekend gemarkeerd: ${unknowns.join(", ")}.` : "Alle velden lijken bekend; aannames blijven toegestaan.",
+  ];
+  return { role: "system", content: lines.join(" ") };
+}
+
 /* -------------------- Generate & Stream -------------------- */
 
 async function generateAndStream({ controller, send, req, prompt, context, history, lastUserMessage, nluHints }) {
@@ -490,7 +512,8 @@ async function generateAndStream({ controller, send, req, prompt, context, histo
       history,
       contextSummary: summarizeContext(context),
       lastUserMessage,
-      nluHints, // <— meegeven
+      nluHints,
+      _ctx: context // <— doorgeven voor unknownPolicySystem
     });
 
     await streamOpenAI({
@@ -541,22 +564,65 @@ function summarizeContext(ctx) {
   return `Bekende context (${parts.join(" • ")}). Gebruik dit impliciet bij je advies als het relevant is.`;
 }
 
-/* ---------- Bouw OpenAI messages ---------- */
-function buildMessagesForOpenAI({ systemExtras = [], prompt, history, contextSummary, lastUserMessage, nluHints }) {
+/* ---------- Bouw OpenAI messages (met nieuwe promptpolicy) ---------- */
+function buildMessagesForOpenAI({ systemExtras = [], prompt, history, contextSummary, lastUserMessage, nluHints, _ctx }) {
+  // ✨ Strengere basisrichtlijnen + output-structuur + gedrag bij onbekend
   const baseSystem = {
     role: "system",
-    content:
-      "Je schrijft compacte, praktische paklijsten in het Nederlands. Gebruik secties: Korte samenvatting, Kleding, Gear, Gadgets, Health, Tips. Geen disclaimers.",
+    content: [
+      // Doel & taal
+      "Je bent een NL-assistent die compacte, praktische backpack-paklijsten maakt. Schrijf in helder Nederlands, direct en zonder disclaimers of excuses.",
+      // Structuur
+      "Gebruik deze secties in onderstaande volgorde: Korte samenvatting, Kleding, Gear, Gadgets, Health, Tips.",
+      "De eerste paragraaf is een verhalende, menselijke intro (2–4 zinnen) die de situatie van de gebruiker samenvat en aannames transparant benoemt.",
+      // Ontbrekende input = niet blokkeren
+      "Behandel land, periode, duur en activiteiten als optioneel. Als iets ontbreekt of ‘onbekend’ is: ga door, maak redelijke aannames, en benoem die kort (‘Als je naar warm/vochtig gebied gaat…’, ‘Bij winter…’, ‘Per extra week…’). Stel geen vervolgvraag in plaats van een antwoord.",
+      // Normalisatie/interpretatie
+      "Normaliseer spelfouten en varianten (‘miss’→‘misschien’, ‘mexcio’→‘Mexico’, ‘paar weekjes’≈14 dagen, ‘rond de jaarwisseling’≈20 dec–10 jan).",
+      // Activiteiten-modules
+      "Als activiteiten onbekend zijn: bied een basislijst + optionele modules (hiken, stad, strand, duiken, etc.).",
+      // Duur onbekend
+      "Als duur onbekend is: geef een minimale kernlijst en voeg uitbreidingen per extra week toe (bijv. +3 T-shirts, +1 onderkleding per 3–4 dagen).",
+      // Periode onbekend
+      "Als periode onbekend is: geef scenario’s voor warm/heet, koel/koud en nat (regen) met korte aanwijzingen per scenario.",
+      // Land onbekend
+      "Als land onbekend is: geef klimaat-agnostische adviezen en varieer waar nodig per klimaat.",
+      // Seizoenscontext
+      "Als er seizoenscontext is meegegeven: gebruik die expliciet in advies en in de secties.",
+      // Machineleesbare hints
+      "Eventuele machineleesbare hints (seasonalRisks, adviceFlags, itemTags, geïnterpreteerde velden) horen via een apart kanaal te gaan; plaats GEEN JSON in de hoofdtekst.",
+      // Stijl/compactheid
+      "Wees concreet en beknopt. Gebruik bullets in secties; geen lange lijstjes met irrelevante items. Geen codeblokken, geen tabellen."
+    ].join("\n")
   };
 
+  // ✨ Policy: ga door, niet doorvragen, ook als onbekend
+  const policyUnknown = unknownPolicySystem(_ctx, nluHints);
+
+  // ✨ Interpretatie van vage taal (few-shot + regel)
   const approxSystem = (nluHints?.policy?.allowApproximate || nluHints?.durationPhrase || nluHints?.periodPhrase)
     ? [{
         role: "system",
         content:
-          "Je mag vage tijdsaanduidingen taalkundig interpreteren. Voorbeelden: 'paar maanden' ≈ 2–3 maanden (neem 3 bij twijfel), 'rond de jaarwisseling' ≈ 20 dec–10 jan. " +
-          "Als er voldoende signaal is in de laatste userboodschap of history, vul ontbrekende velden in zonder opnieuw te vragen; vraag alleen door bij echte ambiguïteit.",
+          "Je mag vage tijdsaanduidingen interpreteren. Voorbeelden: ‘paar maanden’≈60–90 dagen (kies 90 bij twijfel), ‘rond de jaarwisseling’≈20 dec–10 jan. " +
+          "Vul ontbrekende velden in zonder opnieuw te vragen; vraag alleen door bij echte ambiguïteit (niet van toepassing wanneer velden als onbekend zijn gemarkeerd)."
       }]
-    : [];
+    : [{
+        role: "system",
+        content:
+          "Vage tijdsaanduidingen mag je interpreteren: ‘paar weekjes’≈14 dagen, ‘rond de jaarwisseling’≈20 dec–10 jan. " +
+          "Vul ontbrekende velden in zonder door te vragen."
+      }];
+
+  // Korte few-shot interpretaties om normalisatie te forceren
+  const fewShot = [{
+    role: "system",
+    content: [
+      "Voorbeeld interpretaties:",
+      "- User: 'ik ga miss mexcio paar weekjes over 2 mnd' → Normaliseer: land=Mexico; duur≈14 dagen; vertrek≈over 2 maanden.",
+      "- User: 'rond de jaarwisseling naar japan' → Periode≈20 dec–10 jan; land=Japan."
+    ].join("\n")
+  }];
 
   const extras = (systemExtras || []).map((m) => ({ role: "system", content: m.content || m }));
   const ctxMsg = contextSummary ? [{ role: "system", content: contextSummary }] : [];
@@ -564,10 +630,10 @@ function buildMessagesForOpenAI({ systemExtras = [], prompt, history, contextSum
   if (history && history.length) {
     const hist = history.map((m) => ({ role: m.role, content: String(m.content || "").slice(0, 8000) }));
     const tail = lastUserMessage ? [{ role: "user", content: String(lastUserMessage).slice(0, 8000) }] : [];
-    return [...approxSystem, ...extras, baseSystem, ...ctxMsg, ...hist, ...tail];
+    return [policyUnknown, ...fewShot, ...approxSystem, ...extras, baseSystem, ...ctxMsg, ...hist, ...tail];
   }
 
-  return [...approxSystem, ...extras, baseSystem, ...ctxMsg, { role: "user", content: prompt }];
+  return [policyUnknown, ...fewShot, ...approxSystem, ...extras, baseSystem, ...ctxMsg, { role: "user", content: prompt }];
 }
 
 /* -------------------- CSV producten -------------------- */
