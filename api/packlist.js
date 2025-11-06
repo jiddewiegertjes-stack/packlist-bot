@@ -125,23 +125,30 @@ export async function POST(req) {
             !!nluHints?.periodPhrase ||
             /\brond\s+de\s+jaarwisseling|rond\s+kerst|oud.*nieuw\b/.test(userLower);
 
-          const stillMissing = missing.filter((m) =>
-            (m === "durationDays" && !hasDurationSignal) ||
-            (m === "period" && !hasPeriodSignal) ||
-            (m === "destination.country")
-          );
+          // Alleen doorvragen als écht alles ontbreekt (land, duur én periode) en er geen enkel signaal is
+          const HARD_MISS = ["destination.country", "durationDays", "period"];
+          const allHardMissing = HARD_MISS.every(f => missing.includes(f));
+          const hasAnySignal =
+            !!nluHints?.durationDays ||
+            !!nluHints?.month ||
+            !!nluHints?.startDate ||
+            !!safeContext?.destination?.country ||
+            !!safeContext?.durationDays ||
+            (Array.isArray(safeContext?.activities) && safeContext.activities.length > 0) ||
+            hasPeriodSignal || hasDurationSignal;
 
-          if (stillMissing.length > 0) {
-            const followupQ = followupQuestion({ missing: stillMissing, context: safeContext });
-            send("needs", { missing: stillMissing, contextOut: extracted?.context || {} });
+          if (allHardMissing && !hasAnySignal) {
+            const followupQ = followupQuestion({ missing, context: safeContext });
+            send("needs", { missing, contextOut: extracted?.context || {} });
             const derived = await derivedContext(safeContext);
             const seasonsCtx = await seasonsContextFor(safeContext);
-            send("ask", { question: followupQ, missing: stillMissing });
+            send("ask", { question: followupQ, missing });
             send("context", { ...derived, ...seasonsCtx });
             controller.close();
             return;
           }
 
+          // 👉 Anders: ALTIJD genereren, zelfs als 'period' of iets anders nog ontbreekt
           await generateAndStream({
             controller,
             send,
@@ -159,7 +166,15 @@ export async function POST(req) {
         const prompt = hasDirectPrompt ? body.prompt.trim() : buildPromptFromContext(safeContext);
         const missing = missingSlots(safeContext);
 
-        if (!hasDirectPrompt && missing.length > 0) {
+        // Zelfde policy: vraag alleen door als echt alles ontbreekt
+        const HARD_MISS = ["destination.country", "durationDays", "period"];
+        const allHardMissing = HARD_MISS.every(f => missing.includes(f));
+        const hasAnySignal =
+          !!safeContext?.destination?.country ||
+          !!safeContext?.durationDays ||
+          !!safeContext?.month || (safeContext?.startDate && safeContext?.endDate);
+
+        if (!hasDirectPrompt && allHardMissing && !hasAnySignal) {
           const followupQ = followupQuestion({ missing, context: safeContext });
           const derived = await derivedContext(safeContext);
           const seasonsCtx = await seasonsContextFor(safeContext);
@@ -170,6 +185,7 @@ export async function POST(req) {
           return;
         }
 
+        // 👉 Anders: ALTIJD genereren
         await generateAndStream({ controller, send, req, prompt, context: safeContext, history, nluHints });
       } catch (e) {
         closeWithError(e?.message || "Onbekende fout");
@@ -843,7 +859,7 @@ async function chatJSON(system, user, jsonSchema) {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+        "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
       },
       body: JSON.stringify({
         model: OPENAI_MODEL_JSON,
