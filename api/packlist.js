@@ -1,14 +1,16 @@
 export const runtime = "edge";
 
 /**
- * Packlist SSE + Slot-Filling Chat Backend (Edge) — EN version
- * ------------------------------------------------------------
- * - Accepts `history` and `nluHints` from the frontend.
- * - Allows the model to interpret vague language (e.g., "couple of weeks", "around New Year").
- * - Breaks the ask-loop as soon as there is enough signal (duration/period).
- * - Injects season context as an extra system rule.
- * - NEW: Prompt policy to always answer (even if info is missing), avoid follow-up questions,
- *   and normalize typos/variants.
+ * Packlist SSE + Slot-Filling Chat Backend (Edge)
+ * ------------------------------------------------
+ * Deze versie laat het LLM *ChatGPT-achtiger* gedragen:
+ * - Neemt `history` én `nluHints` aan vanuit de frontend.
+ * - Geeft het model expliciete toestemming om vage taal te interpreteren
+ *   (bv. "paar maanden", "rond de jaarwisseling").
+ * - Doorbreekt de `ask`-loop zodra er voldoende signaal is (duration/period).
+ * - Injecteert seizoenscontext als extra systemregel.
+ * - ✨ NIEUW: Prompt-policy om altijd te antwoorden (ook bij onbekend),
+ *   niet door te vragen, en spelling/varianten te normaliseren.
  */
 
 const OPENAI_API_BASE = "https://api.openai.com/v1";
@@ -39,7 +41,7 @@ function originAllowed(origin = "") {
   });
 }
 
-function corsHeaders(req: Request) {
+function corsHeaders(req) {
   const origin = req.headers.get("origin") || "";
   const allowOrigin = originAllowed(origin) ? origin : "*";
   return {
@@ -50,7 +52,7 @@ function corsHeaders(req: Request) {
   };
 }
 
-export async function OPTIONS(req: Request) {
+export async function OPTIONS(req) {
   return new Response(null, {
     status: 204,
     headers: {
@@ -61,7 +63,7 @@ export async function OPTIONS(req: Request) {
   });
 }
 
-export async function GET(req: Request) {
+export async function GET(req) {
   return new Response(JSON.stringify({ ok: true }), {
     status: 200,
     headers: {
@@ -73,10 +75,10 @@ export async function GET(req: Request) {
 
 /* ------------------------------ POST ------------------------------- */
 
-export async function POST(req: Request) {
+export async function POST(req) {
   const stream = new ReadableStream({
     async start(controller) {
-      const send = (event: string, data?: any) => {
+      const send = (event, data) => {
         const payload =
           data === undefined
             ? `event: ${event}\n\n`
@@ -84,12 +86,12 @@ export async function POST(req: Request) {
               `data: ${typeof data === "string" ? data : JSON.stringify(data)}\n\n`;
         controller.enqueue(enc.encode(payload));
       };
-      const closeWithError = (msg: string) => {
+      const closeWithError = (msg) => {
         try { send("error", { message: msg }); } catch {}
         controller.close();
       };
 
-      let body: any;
+      let body;
       try {
         body = await req.json();
       } catch {
@@ -100,33 +102,31 @@ export async function POST(req: Request) {
       const message = (body?.message || "").trim();
       const hasDirectPrompt = typeof body?.prompt === "string" && body.prompt.trim().length > 0;
 
-      // Conversation history and hints from the frontend
+      // Conversatiegeschiedenis en hints uit de frontend
       const history = sanitizeHistory(body?.history);
-      const nluHints = body?.nluHints || null;
+      const nluHints = body?.nluHints || null; // <— hints (duur/maand/taalvarianten)
 
       try {
-        // Free text path (slot-filling)
+        // Vrije tekst pad (slot-filling)
         if (!hasDirectPrompt && message) {
           const extracted = await extractSlots({ utterance: message, context: safeContext });
           mergeInto(safeContext, extracted?.context || {});
           const missing = missingSlots(safeContext);
 
-          // See if there is language signal so we DON'T need to ask
+          // Kijk of er taalsignaal is waardoor we níet hoeven te vragen
           const userLower = message.toLowerCase();
           const hasDurationSignal =
             !!nluHints?.durationDays ||
             !!nluHints?.durationPhrase ||
-            /\b(week|weeks|couple\s*of\s*weeks|month|months)\b/.test(userLower) ||
             /\b(weekje|maandje|paar\s*weken|paar\s*maanden)\b/.test(userLower);
           const hasPeriodSignal =
             !!nluHints?.month ||
             !!nluHints?.startDate ||
             !!nluHints?.periodPhrase ||
-            /\baround\s+new\s*year|around\s+christmas\b/.test(userLower) ||
             /\brond\s+de\s+jaarwisseling|rond\s+kerst|oud.*nieuw\b/.test(userLower);
 
-          // Only ask if EVERYTHING is missing (country, duration AND period) and there is zero signal
-          const HARD_MISS = ["destination.country", "durationDays", "period"] as const;
+          // Alleen doorvragen als écht alles ontbreekt (land, duur én periode) en er geen enkel signaal is
+          const HARD_MISS = ["destination.country", "durationDays", "period"];
           const allHardMissing = HARD_MISS.every(f => missing.includes(f));
           const hasAnySignal =
             !!nluHints?.durationDays ||
@@ -148,7 +148,7 @@ export async function POST(req: Request) {
             return;
           }
 
-          // Otherwise: ALWAYS generate, even if 'period' or something else is still missing
+          // 👉 Anders: ALTIJD genereren, zelfs als 'period' of iets anders nog ontbreekt
           await generateAndStream({
             controller,
             send,
@@ -157,17 +157,17 @@ export async function POST(req: Request) {
             context: safeContext,
             history,
             lastUserMessage: message,
-            nluHints,
+            nluHints, // <— meegeven
           });
           return;
         }
 
-        // Wizard back-compat (direct generate)
+        // Wizard back-compat (direct genereren)
         const prompt = hasDirectPrompt ? body.prompt.trim() : buildPromptFromContext(safeContext);
         const missing = missingSlots(safeContext);
 
-        // Same policy: only ask if absolutely everything is missing
-        const HARD_MISS = ["destination.country", "durationDays", "period"] as const;
+        // Zelfde policy: vraag alleen door als echt alles ontbreekt
+        const HARD_MISS = ["destination.country", "durationDays", "period"];
         const allHardMissing = HARD_MISS.every(f => missing.includes(f));
         const hasAnySignal =
           !!safeContext?.destination?.country ||
@@ -185,10 +185,10 @@ export async function POST(req: Request) {
           return;
         }
 
-        // Otherwise: ALWAYS generate
+        // 👉 Anders: ALTIJD genereren
         await generateAndStream({ controller, send, req, prompt, context: safeContext, history, nluHints });
-      } catch (e: any) {
-        closeWithError(e?.message || "Unknown error");
+      } catch (e) {
+        closeWithError(e?.message || "Onbekende fout");
       }
     },
   });
@@ -206,7 +206,7 @@ export async function POST(req: Request) {
 
 /* -------------------- Context helpers -------------------- */
 
-function normalizeContext(ctx: any = {}) {
+function normalizeContext(ctx = {}) {
   const c = typeof ctx === "object" && ctx ? structuredClone(ctx) : {};
   c.destination = c.destination || {};
   if (c.activities && !Array.isArray(c.activities)) {
@@ -220,33 +220,33 @@ function normalizeContext(ctx: any = {}) {
   c.activities = Array.isArray(c.activities) ? c.activities : [];
   return c;
 }
-function ensureKeys(o: any, keys: string[]) { for (const k of keys) if (!(k in o)) o[k] = null; }
+function ensureKeys(o, keys) { for (const k of keys) if (!(k in o)) o[k] = null; }
 
-function missingSlots(ctx: any) {
-  const missing: string[] = [];
+function missingSlots(ctx) {
+  const missing = [];
   if (!ctx?.destination?.country) missing.push("destination.country");
   if (!ctx?.durationDays || ctx.durationDays < 1) missing.push("durationDays");
   if (!ctx?.month && !(ctx?.startDate && ctx?.endDate)) missing.push("period");
   return missing;
 }
 
-function buildPromptFromContext(ctx: any) {
+function buildPromptFromContext(ctx) {
   const where = [ctx?.destination?.country, ctx?.destination?.region].filter(Boolean).join(" - ") || "?";
-  const when = ctx?.month ? `in ${ctx.month}` : `${ctx?.startDate || "?"} to ${ctx?.endDate || "?"}`;
+  const when = ctx?.month ? `in ${ctx.month}` : `${ctx?.startDate || "?"} t/m ${ctx?.endDate || "?"}`;
   const acts =
     Array.isArray(ctx?.activities) && ctx.activities.length
-      ? ` Activities: ${ctx.activities.join(", ")}.`
+      ? ` Activiteiten: ${ctx.activities.join(", ")}.`
       : "";
   const days = ctx?.durationDays || "?";
-  return `Create a backpacking packing list for ${days} days to ${where}, ${when}.${acts}`;
+  return `Maak een backpack paklijst voor ${days} dagen naar ${where}, ${when}.${acts}`;
 }
 
-/* -------------------- Hybrid slot extraction -------------------- */
+/* -------------------- Hybride slot-extractie -------------------- */
 
-async function extractSlots({ utterance, context }: { utterance: string, context: any }) {
-  // 1) Regex baseline (works without API key)
+async function extractSlots({ utterance, context }) {
+  // 1) Regex baseline (werkt zonder API-key)
   const m = (utterance || "").toLowerCase().normalize("NFKD").replace(/[\u0300-\u036f]/g, "");
-  const baseline: any = {
+  const baseline = {
     context: {
       durationDays: null,
       destination: { country: null, region: null },
@@ -258,37 +258,31 @@ async function extractSlots({ utterance, context }: { utterance: string, context
     },
   };
 
-  // Countries (minimal offline fallback)
+  // Landen
   const COUNTRY = [
     { re: /\bvietnam\b/,                 name: "Vietnam" },
-    { re: /\bindonesia|indonesie\b/,     name: "Indonesia" },
+    { re: /\bindonesie|indonesia\b/,     name: "Indonesië" },
     { re: /\bthailand\b/,                name: "Thailand" },
-    { re: /\bmalaysia|maleisie\b/,       name: "Malaysia" },
-    { re: /\bphilippines|filipijnen\b/,  name: "Philippines" },
+    { re: /\bmaleisie|malaysia\b/,       name: "Maleisië" },
+    { re: /\bfilipijnen|philippines\b/,  name: "Filipijnen" },
     { re: /\blaos\b/,                    name: "Laos" },
-    { re: /\bcambodia|cambodja\b/,       name: "Cambodia" },
+    { re: /\bcambodja|cambodia\b/,       name: "Cambodja" },
   ];
   const hit = COUNTRY.find(c => c.re.test(m));
   if (hit) baseline.context.destination.country = hit.name;
 
-  // Month (support EN + NL)
-  const MONTH_EN = /(january|february|march|april|may|june|july|august|september|october|november|december)/;
-  const MONTH_NL = /(januari|februari|maart|april|mei|juni|juli|augustus|september|oktober|november|december)/;
-  const mm = m.match(MONTH_EN) || m.match(MONTH_NL);
-  if (mm) baseline.context.month = capitalize(mm[1]);
+  // Maand
+  const MONTH = /(januari|februari|maart|april|mei|juni|juli|augustus|september|oktober|november|december)/;
+  const mm = m.match(MONTH);
+  if (mm) baseline.context.month = mm[1];
 
-  // Duration (EN + NL)
-  const dDays = m.match(/(\d{1,3})\s*(days|day|dgn|dagen|dag|d)\b/);
-  const dWks  = m.match(/(\d{1,2})\s*(weeks|week|wk|w|weken)\b/);
+  // Duur
+  const dDays = m.match(/(\d{1,3})\s*(dagen|dag|dgn|d)\b/);
+  const dWks  = m.match(/(\d{1,2})\s*(weken|wk|w)\b/);
   if (dDays) baseline.context.durationDays = Number(dDays[1]);
   else if (dWks) baseline.context.durationDays = Number(dWks[1]) * 7;
-  // vague EN phrases
-  if (!baseline.context.durationDays) {
-    if (/\bcouple\s+of\s+weeks\b/.test(m) || /\bpaar\s*weken\b/.test(m)) baseline.context.durationDays = 14;
-    else if (/\bcouple\s+of\s+months\b/.test(m) || /\bpaar\s*maanden\b/.test(m)) baseline.context.durationDays = 90; // bias high
-  }
 
-  // Date range (optional) dd/mm/yyyy ... dd/mm/yyyy
+  // Datumbereik (optioneel)
   const dateRange = m.match(/(\d{1,2})[-\/.](\d{1,2})[-\/.](\d{2,4}).{0,30}?(\d{1,2})[-\/.](\d{1,2})[-\/.](\d{2,4})/);
   if (dateRange) {
     const [, d1, mo1, y1, d2, mo2, y2] = dateRange;
@@ -296,20 +290,20 @@ async function extractSlots({ utterance, context }: { utterance: string, context
     baseline.context.endDate   = toISO(y2, mo2, d2);
   }
 
-  // Activities (EN + NL)
-  const acts: string[] = [];
-  if (/(dive|diving|snorkel|scuba|duik|duiken)/.test(m)) acts.push("diving");
-  if (/(hike|hiking|trek|walk|wandelen|hiken)/.test(m)) acts.push("hiking");
-  if (/(surf|surfing|surfen)/.test(m)) acts.push("surfing");
-  if (/(city|citytrip|stad)/.test(m)) acts.push("city");
+  // Activiteiten
+  const acts = [];
+  if (/(duik|duiken|snorkel|scuba)/.test(m)) acts.push("duiken");
+  if (/(hike|hiken|trek|wandelen)/.test(m)) acts.push("hiken");
+  if (/(surf|surfen)/.test(m)) acts.push("surfen");
+  if (/(city|stad|citytrip)/.test(m)) acts.push("citytrip");
   if (acts.length) baseline.context.activities = acts;
 
-  // 2) Optional: LLM enrichment
+  // 2) Optioneel: LLM-verrijking
   if (process.env.OPENAI_API_KEY) {
     try {
       const schema = { type: "object", properties: { context: { type: "object" } }, required: ["context"], additionalProperties: true };
-      const sys = "Enrich the given context with explicitly mentioned facts. Return JSON ONLY.";
-      const user = `Current context: ${JSON.stringify(context)}\nUtterance: "${utterance}"\nAdd mentioned fields; keep unknown as null.`;
+      const sys = "Verrijk onderstaande context met expliciet genoemde feiten. Geef ALLEEN JSON.";
+      const user = `Huidige context: ${JSON.stringify(context)}\nZin: "${utterance}"\nVoeg genoemde velden toe; onbekend blijft null.`;
       const llm = await chatJSON(sys, user, schema);
       mergeInto(baseline, llm);
     } catch {}
@@ -318,14 +312,14 @@ async function extractSlots({ utterance, context }: { utterance: string, context
   return baseline;
 }
 
-function toISO(y: string | number, m: string | number, d: string | number) {
+function toISO(y, m, d) {
   const year = (+y < 100 ? 2000 + (+y) : +y);
   const month = String(+m).padStart(2, "0");
   const day = String(+d).padStart(2, "0");
   return `${year}-${month}-${day}`;
 }
 
-function mergeInto(target: any, src: any) {
+function mergeInto(target, src) {
   if (!src || typeof src !== "object") return;
   for (const k of Object.keys(src)) {
     const v = src[k];
@@ -338,44 +332,44 @@ function mergeInto(target: any, src: any) {
   }
 }
 
-/* -------------------- Follow-up question (deterministic) -------------------- */
+/* -------------------- Vervolgvraag (deterministisch) -------------------- */
 
-function followupQuestion({ missing, context }: { missing: string[], context: any }) {
-  const labels: string[] = [];
-  if (missing.includes("destination.country")) labels.push("destination (country, optional region)");
-  if (missing.includes("durationDays")) labels.push("how many days");
-  if (missing.includes("period")) labels.push("which period (month or exact dates)");
-  const pref: string[] = [];
-  if (context?.destination?.country) pref.push(`destination: ${context.destination.country}`);
-  if (context?.durationDays) pref.push(`duration: ${context.durationDays} days`);
-  if (context?.month) pref.push(`month: ${context.month}`);
-  if (context?.startDate && context?.endDate) pref.push(`dates: ${context.startDate} to ${context.endDate}`);
-  const hint = pref.length ? ` (known: ${pref.join(", ")})` : "";
-  return `Could you also specify: ${labels.join(", ")}?${hint}`;
+function followupQuestion({ missing, context }) {
+  const labels = [];
+  if (missing.includes("destination.country")) labels.push("bestemming (land, optioneel regio)");
+  if (missing.includes("durationDays")) labels.push("hoeveel dagen");
+  if (missing.includes("period")) labels.push("in welke periode (maand of exacte data)");
+  const pref = [];
+  if (context?.destination?.country) pref.push(`bestemming: ${context.destination.country}`);
+  if (context?.durationDays) pref.push(`duur: ${context.durationDays} dagen`);
+  if (context?.month) pref.push(`maand: ${context.month}`);
+  if (context?.startDate && context?.endDate) pref.push(`data: ${context.startDate} t/m ${context.endDate}`);
+  const hint = pref.length ? ` (bekend: ${pref.join(", ")})` : "";
+  return `Kun je nog aangeven: ${labels.join(", " )}?${hint}`;
 }
 
-/* -------------------- Derived context (LLM) -------------------- */
+/* -------------------- Afgeleide context (LLM) -------------------- */
 
-async function derivedContext(ctx: any) {
+async function derivedContext(ctx) {
   const sys =
-    "Determine, if possible, the season (winter/spring/summer/fall or tropical wet/dry) based on country/month or dates. Short answer, only field 'season'. Return JSON.";
+    "Bepaal, indien mogelijk, het seizoen (winter/lente/zomer/herfst of tropisch nat/droog) op basis van land/maand of data. Kort antwoord, alleen het veld 'season'. Geef JSON.";
   const user = `Context: ${JSON.stringify(ctx)}.`;
   const schema = { type: "object", properties: { season: { type: ["string", "null"] } }, required: ["season"] };
   const json = await chatJSON(sys, user, schema);
   return json;
 }
 
-/* -------------------- Seasons CSV integration -------------------- */
+/* -------------------- Seasons CSV integratie -------------------- */
 const SEASONS_CSV_URL = (process.env.SEASONS_CSV_URL || "").trim();
-const SEASONS_TTL_MS = 6 * 60 * 60 * 1000; // 6h
+const SEASONS_TTL_MS = 6 * 60 * 60 * 1000; // 6 uur
 const MONTHS_EN = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
-const NL2EN: Record<string, string> = {
+const NL2EN = {
   januari:"Jan", februari:"Feb", maart:"Mar", april:"Apr", mei:"May", juni:"Jun",
   juli:"Jul", augustus:"Aug", september:"Sep", oktober:"Oct", november:"Nov", december:"Dec"
 };
-let __SEASONS_CACHE__: { rows: any[] | null, at: number } = { rows: null, at: 0 };
+let __SEASONS_CACHE__ = { rows: null, at: 0 };
 
-async function seasonsContextFor(ctx: any) {
+async function seasonsContextFor(ctx) {
   try {
     const tbl = await loadSeasonsTable();
     if (!tbl || !tbl.length) return {};
@@ -389,7 +383,7 @@ async function seasonsContextFor(ctx: any) {
 async function loadSeasonsTable() {
   if (!SEASONS_CSV_URL) return [];
   if (__SEASONS_CACHE__.rows && Date.now() - __SEASONS_CACHE__.at < SEASONS_TTL_MS) {
-    return __SEASONS_CACHE__.rows!;
+    return __SEASONS_CACHE__.rows;
   }
   const res = await fetch(SEASONS_CSV_URL, { cache: "no-store" });
   if (!res.ok) return [];
@@ -399,12 +393,10 @@ async function loadSeasonsTable() {
   return rows;
 }
 
-function monthAbbrevFromContext(ctx: any) {
+function monthAbbrevFromContext(ctx) {
   if (ctx?.month) {
-    const raw = String(ctx.month).toLowerCase().trim();
-    // accept EN or NL month names
-    const en = MONTHS_EN.find(mm => mm.toLowerCase().startsWith(raw.slice(0,3)));
-    return NL2EN[raw] || en || null;
+    const m = String(ctx.month).toLowerCase().trim();
+    return NL2EN[m] || MONTHS_EN.find(mm => mm.toLowerCase().startsWith(m.slice(0,3))) || null;
   }
   if (ctx?.startDate) {
     try {
@@ -415,7 +407,7 @@ function monthAbbrevFromContext(ctx: any) {
   return null;
 }
 
-function normStr(s: string) {
+function normStr(s) {
   return String(s || "")
     .normalize("NFKD")
     .replace(/[\u0300-\u036f]/g, "")
@@ -423,15 +415,15 @@ function normStr(s: string) {
     .trim();
 }
 
-function inSeasonEN(monthAbbrev: string | null, start: string, end: string) {
+function inSeasonEN(monthAbbrev, start, end) {
   if (!monthAbbrev || !start || !end) return false;
-  const idx = (m: string) => MONTHS_EN.indexOf(m) + 1;
+  const idx = (m) => MONTHS_EN.indexOf(m) + 1;
   const m = idx(monthAbbrev), a = idx(start), b = idx(end);
   if (!m || !a || !b) return false;
   return a <= b ? (m >= a && m <= b) : (m >= a || m <= b);
 }
 
-function computeSeasonInfoForContext(ctx: any, table: any[]) {
+function computeSeasonInfoForContext(ctx, table) {
   const country = ctx?.destination?.country;
   const region = ctx?.destination?.region;
   const monthAbbrev = monthAbbrevFromContext(ctx);
@@ -440,88 +432,87 @@ function computeSeasonInfoForContext(ctx: any, table: any[]) {
   const C = normStr(country);
   const R = normStr(region);
 
-  const hits = table.filter((r: any) => {
+  const hits = table.filter((r) => {
     const rc = normStr(r.country);
     const rr = normStr(r.region);
     const regionMatch = rr ? (rc === C && rr === R) : (rc === C);
     return regionMatch && inSeasonEN(monthAbbrev, r.start_month, r.end_month);
   });
 
-  const climate = hits.find((h: any) => String(h.type).toLowerCase() === "climate")?.label || null;
+  const climate = hits.find(h => String(h.type).toLowerCase() === "climate")?.label || null;
 
   const risks = hits
-    .filter((h: any) => String(h.type).toLowerCase() === "risk")
-    .map((h: any) => ({
+    .filter(h => String(h.type).toLowerCase() === "risk")
+    .map(h => ({
       type: String(h.label || "").toLowerCase(),
       level: String(h.level || "unknown").toLowerCase(),
       note: h.note || ""
     }));
 
-  const flags: Record<string, boolean> = {};
-  const items = new Set<string>();
+  const flags = {};
+  const items = new Set();
   for (const h of hits) {
-    String((h as any).advice_flags || "")
+    String(h.advice_flags || "")
       .split(",")
-      .map((s) => s.trim())
+      .map(s => s.trim())
       .filter(Boolean)
-      .forEach((f) => (flags[f] = true));
-    String((h as any).item_tags || "")
+      .forEach(f => flags[f] = true);
+    String(h.item_tags || "")
       .split(",")
-      .map((s) => s.trim())
+      .map(s => s.trim())
       .filter(Boolean)
-      .forEach((t) => items.add(t));
+      .forEach(t => items.add(t));
   }
 
   return { season: climate, seasonalRisks: risks, adviceFlags: flags, itemTags: Array.from(items) };
 }
 
-/* -------------------- Season prompt injection -------------------- */
+/* -------------------- Prompt-injectie seizoenscontext -------------------- */
 
-function seasonPromptLines(seasonsCtx: any) {
-  const bits: string[] = [];
+function seasonPromptLines(seasonsCtx) {
+  const bits = [];
   if (seasonsCtx?.season) {
-    bits.push(`Season context: ${seasonsCtx.season}.`);
+    bits.push(`Seizoenscontext: ${seasonsCtx.season}.`);
   }
   if (Array.isArray(seasonsCtx?.seasonalRisks) && seasonsCtx.seasonalRisks.length) {
     const top = seasonsCtx.seasonalRisks[0];
     const lvl = top.level ? ` (${top.level})` : "";
-    bits.push(`Key risks: ${top.type}${lvl}.`);
+    bits.push(`Belangrijke risico's: ${top.type}${lvl}.`);
   }
   if (!bits.length) return [];
   return [
     {
       role: "system",
       content:
-        `Use this season context explicitly in advice and packing list (clothing/gear/health/tips). ` +
+        `Gebruik deze seizoenscontext expliciet in de adviezen en paklijst (kleding/gear/health/tips). ` +
         bits.join(" "),
     },
   ];
 }
 
-/* -------------------- Prompt policy helpers -------------------- */
+/* -------------------- ✨ Prompt policy helpers -------------------- */
 
-/** Force: proceed with answers (even if unknown), don't ask follow-ups, normalize variants */
-function unknownPolicySystem(ctx: any, nluHints: any) {
-  const unknowns: string[] = [];
-  if (ctx?.unknownCountry) unknowns.push("country/destination");
-  if (ctx?.unknownPeriod) unknowns.push("period (month or dates)");
-  if (ctx?.unknownDuration) unknowns.push("duration (days)");
-  if (!ctx?.destination?.country && !unknowns.includes("country/destination")) unknowns.push("country/destination");
-  if (!ctx?.month && !(ctx?.startDate && ctx?.endDate) && !unknowns.includes("period (month or dates)")) unknowns.push("period (month or dates)");
-  if (!ctx?.durationDays && !unknowns.includes("duration (days)")) unknowns.push("duration (days)");
+/** Forceer: ga door met antwoorden (ook bij onbekend), niet doorvragen, normaliseer varianten */
+function unknownPolicySystem(ctx, nluHints) {
+  const unknowns = [];
+  if (ctx?.unknownCountry) unknowns.push("land/bestemming");
+  if (ctx?.unknownPeriod) unknowns.push("periode (maand of data)");
+  if (ctx?.unknownDuration) unknowns.push("duur (aantal dagen)");
+  if (!ctx?.destination?.country && !unknowns.includes("land/bestemming")) unknowns.push("land/bestemming");
+  if (!ctx?.month && !(ctx?.startDate && ctx?.endDate) && !unknowns.includes("periode (maand of data)")) unknowns.push("periode (maand of data)");
+  if (!ctx?.durationDays && !unknowns.includes("duur (aantal dagen)")) unknowns.push("duur (aantal dagen)");
 
   const lines = [
-    "Proceed with answers even if the following fields are unknown.",
-    "Do NOT ask follow-up questions; make reasonable assumptions and state them briefly.",
-    unknowns.length ? `Marked as unknown: ${unknowns.join(", ")}.` : "All fields seem known; assumptions still allowed.",
+    "Ga door met antwoorden, ook als onderstaande velden onbekend zijn.",
+    "Stel géén vervolgvraag; maak redelijke aannames en benoem ze kort in de tekst.",
+    unknowns.length ? `Onbekend gemarkeerd: ${unknowns.join(", ")}.` : "Alle velden lijken bekend; aannames blijven toegestaan.",
   ];
   return { role: "system", content: lines.join(" ") };
 }
 
 /* -------------------- Generate & Stream -------------------- */
 
-async function generateAndStream({ controller, send, req, prompt, context, history, lastUserMessage, nluHints }:
-  { controller: ReadableStreamDefaultController, send: Function, req: Request, prompt: string, context: any, history: any, lastUserMessage?: string, nluHints?: any }) {
+async function generateAndStream({ controller, send, req, prompt, context, history, lastUserMessage, nluHints }) {
   const derived = await derivedContext(context);
   const seasonsCtx = await seasonsContextFor(context);
 
@@ -538,15 +529,15 @@ async function generateAndStream({ controller, send, req, prompt, context, histo
       contextSummary: summarizeContext(context),
       lastUserMessage,
       nluHints,
-      _ctx: context
+      _ctx: context // <— doorgeven voor unknownPolicySystem
     });
 
     await streamOpenAI({
       messages,
-      onDelta: (chunk: string) => send("delta", chunk),
+      onDelta: (chunk) => send("delta", chunk),
     });
-  } catch (e: any) {
-    send("error", { message: e?.message || "Generation error" });
+  } catch (e) {
+    send("error", { message: e?.message || "Fout bij genereren" });
     controller.close();
     return;
   }
@@ -559,7 +550,7 @@ async function generateAndStream({ controller, send, req, prompt, context, histo
         send("products", products.slice(i, i + batch));
       }
     }
-  } catch (e: any) {
+  } catch (e) {
     send("products", [{
       category: "DEBUG",
       name: `products error: ${(e && e.message) || "unknown"}`,
@@ -576,85 +567,84 @@ async function generateAndStream({ controller, send, req, prompt, context, histo
   controller.close();
 }
 
-/* ---------- Context summary (inject as system) ---------- */
-function summarizeContext(ctx: any) {
-  const parts: string[] = [];
-  if (ctx?.destination?.country) parts.push(`country: ${ctx.destination.country}`);
-  if (ctx?.destination?.region) parts.push(`region: ${ctx.destination.region}`);
-  if (ctx?.durationDays) parts.push(`duration: ${ctx.durationDays} days`);
-  if (ctx?.month) parts.push(`month: ${ctx.month}`);
-  if (ctx?.startDate && ctx?.endDate) parts.push(`dates: ${ctx.startDate} to ${ctx.endDate}`);
-  if (Array.isArray(ctx?.activities) && ctx.activities.length) parts.push(`activities: ${ctx.activities.join(", ")}`);
+/* ---------- Context samenvatting (inject als system) ---------- */
+function summarizeContext(ctx) {
+  const parts = [];
+  if (ctx?.destination?.country) parts.push(`land: ${ctx.destination.country}`);
+  if (ctx?.destination?.region) parts.push(`regio: ${ctx.destination.region}`);
+  if (ctx?.durationDays) parts.push(`duur: ${ctx.durationDays} dagen`);
+  if (ctx?.month) parts.push(`maand: ${ctx.month}`);
+  if (ctx?.startDate && ctx?.endDate) parts.push(`data: ${ctx.startDate} t/m ${ctx.endDate}`);
+  if (Array.isArray(ctx?.activities) && ctx.activities.length) parts.push(`activiteiten: ${ctx.activities.join(", ")}`);
   if (!parts.length) return null;
-  return `Known context (${parts.join(" • ")}). Use this implicitly in your advice if relevant.`;
+  return `Bekende context (${parts.join(" • ")}). Gebruik dit impliciet bij je advies als het relevant is.`;
 }
 
-/* ---------- Build OpenAI messages (with new prompt policy) ---------- */
-function buildMessagesForOpenAI({ systemExtras = [], prompt, history, contextSummary, lastUserMessage, nluHints, _ctx }:
-  { systemExtras?: any[], prompt: string, history: any, contextSummary?: string | null, lastUserMessage?: string, nluHints?: any, _ctx: any }) {
-
+/* ---------- Bouw OpenAI messages (met nieuwe promptpolicy) ---------- */
+function buildMessagesForOpenAI({ systemExtras = [], prompt, history, contextSummary, lastUserMessage, nluHints, _ctx }) {
+  // ✨ Strengere basisrichtlijnen + output-structuur + gedrag bij onbekend
   const baseSystem = {
     role: "system",
     content: [
-      // Goal & language
-      "You are an assistant that writes concise, practical backpacking packing lists in English. Write clearly, directly, with no disclaimers or apologies.",
-      // Structure
-      "Use these sections in this exact order: Short summary, Clothing, Gear, Gadgets, Health, Tips.",
-      "Start with a short, human intro (2–4 sentences) that summarizes the user's situation and states assumptions transparently.",
-      // Missing input must NOT block output
-      "Treat country, period, duration and activities as optional. If something is unknown: proceed, make reasonable assumptions, and mention them briefly (e.g., “If you're going to warm/humid areas…”, “For winter…”, “Per extra week…”). Do not ask follow-up questions instead of answering.",
-      // Normalization/interpretation
-      "Normalize typos and variants (e.g., “mexcio”→“Mexico”, “couple of weeks”≈14 days, “around New Year”≈Dec 20–Jan 10).",
-      // Activities modules
-      "If activities are unknown: provide a base list + optional modules (hiking, city, beach, diving, etc.).",
-      // Unknown duration
-      "If duration is unknown: provide a minimal core list and add scalable items per extra week (e.g., +3 T-shirts, +1 underwear per 3–4 days).",
-      // Unknown period
-      "If period is unknown: provide guidance for warm/hot, cool/cold and wet (rain) with short pointers per scenario.",
-      // Unknown country
-      "If country is unknown: give climate-agnostic advice and branch where helpful by climate.",
-      // Season context
-      "If season context is provided, incorporate it explicitly in advice and sections.",
-      // Machine-readable hints
-      "Any machine-readable hints (seasonalRisks, adviceFlags, itemTags, interpreted fields) should be out-of-band; do NOT place JSON in the main text.",
-      // Style/compactness
-      "Be concrete and brief. Use bullets in sections; avoid long irrelevant lists. No code blocks, no tables."
+      // Doel & taal
+      "Je bent een NL-assistent die compacte, praktische backpack-paklijsten maakt. Schrijf in helder Nederlands, direct en zonder disclaimers of excuses.",
+      // Structuur
+      "Gebruik deze secties in onderstaande volgorde: Korte samenvatting, Kleding, Gear, Gadgets, Health, Tips.",
+      "De eerste paragraaf is een verhalende, menselijke intro (2–4 zinnen) die de situatie van de gebruiker samenvat en aannames transparant benoemt.",
+      // Ontbrekende input = niet blokkeren
+      "Behandel land, periode, duur en activiteiten als optioneel. Als iets ontbreekt of ‘onbekend’ is: ga door, maak redelijke aannames, en benoem die kort (‘Als je naar warm/vochtig gebied gaat…’, ‘Bij winter…’, ‘Per extra week…’). Stel geen vervolgvraag in plaats van een antwoord.",
+      // Normalisatie/interpretatie
+      "Normaliseer spelfouten en varianten (‘miss’→‘misschien’, ‘mexcio’→‘Mexico’, ‘paar weekjes’≈14 dagen, ‘rond de jaarwisseling’≈20 dec–10 jan).",
+      // Activiteiten-modules
+      "Als activiteiten onbekend zijn: bied een basislijst + optionele modules (hiken, stad, strand, duiken, etc.).",
+      // Duur onbekend
+      "Als duur onbekend is: geef een minimale kernlijst en voeg uitbreidingen per extra week toe (bijv. +3 T-shirts, +1 onderkleding per 3–4 dagen).",
+      // Periode onbekend
+      "Als periode onbekend is: geef scenario’s voor warm/heet, koel/koud en nat (regen) met korte aanwijzingen per scenario.",
+      // Land onbekend
+      "Als land onbekend is: geef klimaat-agnostische adviezen en varieer waar nodig per klimaat.",
+      // Seizoenscontext
+      "Als er seizoenscontext is meegegeven: gebruik die expliciet in advies en in de secties.",
+      // Machineleesbare hints
+      "Eventuele machineleesbare hints (seasonalRisks, adviceFlags, itemTags, geïnterpreteerde velden) horen via een apart kanaal te gaan; plaats GEEN JSON in de hoofdtekst.",
+      // Stijl/compactheid
+      "Wees concreet en beknopt. Gebruik bullets in secties; geen lange lijstjes met irrelevante items. Geen codeblokken, geen tabellen."
     ].join("\n")
   };
 
-  // Policy: proceed, no follow-ups, even if unknown
+  // ✨ Policy: ga door, niet doorvragen, ook als onbekend
   const policyUnknown = unknownPolicySystem(_ctx, nluHints);
 
-  // Interpretation of vague time phrases (few-shot + rule)
+  // ✨ Interpretatie van vage taal (few-shot + regel)
   const approxSystem = (nluHints?.policy?.allowApproximate || nluHints?.durationPhrase || nluHints?.periodPhrase)
     ? [{
         role: "system",
         content:
-          "You may interpret vague time phrases. Examples: “couple of months”≈60–90 days (pick 90 if unsure), “around New Year”≈Dec 20–Jan 10. " +
-          "Fill missing fields without re-asking; only ask in case of true ambiguity (not applicable when fields are marked as unknown)."
+          "Je mag vage tijdsaanduidingen interpreteren. Voorbeelden: ‘paar maanden’≈60–90 dagen (kies 90 bij twijfel), ‘rond de jaarwisseling’≈20 dec–10 jan. " +
+          "Vul ontbrekende velden in zonder opnieuw te vragen; vraag alleen door bij echte ambiguïteit (niet van toepassing wanneer velden als onbekend zijn gemarkeerd)."
       }]
     : [{
         role: "system",
         content:
-          "You may interpret vague time phrases: “couple of weeks”≈14 days, “around New Year”≈Dec 20–Jan 10. " +
-          "Fill missing fields without asking again."
+          "Vage tijdsaanduidingen mag je interpreteren: ‘paar weekjes’≈14 dagen, ‘rond de jaarwisseling’≈20 dec–10 jan. " +
+          "Vul ontbrekende velden in zonder door te vragen."
       }];
 
-  // Short few-shot interpretations to force normalization
+  // Korte few-shot interpretaties om normalisatie te forceren
   const fewShot = [{
     role: "system",
     content: [
-      "Interpretation examples:",
-      `- User: "i'll go to mexcio couple weeks in 2 months" → Normalize: country=Mexico; duration≈14 days; departure≈in 2 months.`,
-      `- User: "around new year to japan" → Period≈Dec 20–Jan 10; country=Japan.`
+      "Voorbeeld interpretaties:",
+      "- User: 'ik ga miss mexcio paar weekjes over 2 mnd' → Normaliseer: land=Mexico; duur≈14 dagen; vertrek≈over 2 maanden.",
+      "- User: 'rond de jaarwisseling naar japan' → Periode≈20 dec–10 jan; land=Japan."
     ].join("\n")
   }];
 
-  const extras = (systemExtras || []).map((m: any) => ({ role: "system", content: m.content || m }));
+  const extras = (systemExtras || []).map((m) => ({ role: "system", content: m.content || m }));
   const ctxMsg = contextSummary ? [{ role: "system", content: contextSummary }] : [];
 
   if (history && history.length) {
-    const hist = history.map((m: any) => ({ role: m.role, content: String(m.content || "").slice(0, 8000) }));
+    const hist = history.map((m) => ({ role: m.role, content: String(m.content || "").slice(0, 8000) }));
     const tail = lastUserMessage ? [{ role: "user", content: String(lastUserMessage).slice(0, 8000) }] : [];
     return [policyUnknown, ...fewShot, ...approxSystem, ...extras, baseSystem, ...ctxMsg, ...hist, ...tail];
   }
@@ -662,29 +652,29 @@ function buildMessagesForOpenAI({ systemExtras = [], prompt, history, contextSum
   return [policyUnknown, ...fewShot, ...approxSystem, ...extras, baseSystem, ...ctxMsg, { role: "user", content: prompt }];
 }
 
-/* -------------------- CSV products -------------------- */
-const CSV_PUBLIC_PATH = "/pack_products.csv"; // fallback path
+/* -------------------- CSV producten -------------------- */
+const CSV_PUBLIC_PATH = "/pack_products.csv"; // fallback-pad
 
-function resolveCsvUrl(origin: string) {
+function resolveCsvUrl(origin) {
   const url = (process.env.PRODUCTS_CSV_URL && String(process.env.PRODUCTS_CSV_URL).trim()) || "";
   return url || new URL(CSV_PUBLIC_PATH, origin).toString();
 }
 
 function getCsvCache() {
-  if (!(globalThis as any).__PACKLIST_CSV__) {
-    (globalThis as any).__PACKLIST_CSV__ = { rows: null, at: 0 };
+  if (!globalThis.__PACKLIST_CSV__) {
+    globalThis.__PACKLIST_CSV__ = { rows: null, at: 0 };
   }
-  return (globalThis as any).__PACKLIST_CSV__;
+  return globalThis.__PACKLIST_CSV__;
 }
 
-async function productsFromCSV(ctx: any, req: Request) {
+async function productsFromCSV(ctx, req) {
   const origin = new URL(req.url).origin;
   const resolvedUrl = resolveCsvUrl(origin);
 
-  let rows: any[];
+  let rows;
   try {
     rows = await loadCsvOnce(origin);
-  } catch (e: any) {
+  } catch (e) {
     return [{
       category: "DEBUG",
       name: `CSV load error: ${(e && e.message) || "unknown"}`,
@@ -696,43 +686,36 @@ async function productsFromCSV(ctx: any, req: Request) {
     }];
   }
 
-  const acts  = (ctx?.activities || []).map((s: string) => String(s).toLowerCase());
-  const rawMonth = (ctx?.month || "").toLowerCase();
+  const acts  = (ctx?.activities || []).map((s) => String(s).toLowerCase());
+  const month = (ctx?.month || "").toLowerCase();
 
   let seasonHint = "";
-  // Support EN and NL month names for basic winter/summer buckets
-  const monthToSeason: Record<string, string> = {
-    december: "winter", januari: "winter", februari: "winter",
-    january: "winter", february: "winter", march: "",
-    june: "summer", july: "summer", august: "summer",
-    juni: "summer", juli: "summer", augustus: "summer"
-  };
-  seasonHint = monthToSeason[rawMonth] || "";
+  if (["december","januari","februari"].includes(month)) seasonHint = "winter";
+  else if (["juni","juli","augustus"].includes(month))   seasonHint = "zomer";
 
-  const filtered = rows.filter((r: any) => {
+  const filtered = rows.filter((r) => {
     const prodActs    = splitCsvList(r.activities);
     const prodSeasons = splitCsvList(r.seasons);
 
     const actsOk =
       prodActs.length === 0 ||
-      acts.some((a: string) => prodActs.includes(a));
+      acts.some((a) => prodActs.includes(a));
 
     const seasonOk =
       prodSeasons.length === 0 ||
-      prodSeasons.includes("all") || // EN
-      prodSeasons.includes("alle") || // NL (compat)
+      prodSeasons.includes("alle") ||
       (seasonHint && prodSeasons.includes(seasonHint)) ||
-      (rawMonth && prodSeasons.includes(rawMonth));
+      (month && prodSeasons.includes(month));
 
     return actsOk && seasonOk;
   });
 
   let outRows = filtered;
   if (outRows.length === 0) {
-    outRows = rows.filter((r: any) => {
+    outRows = rows.filter((r) => {
       const a = splitCsvList(r.activities).length === 0;
       const s = splitCsvList(r.seasons);
-      return a && (s.length === 0 || s.includes("all") || s.includes("alle"));
+      return a && (s.length === 0 || s.includes("alle"));
     });
   }
 
@@ -741,17 +724,17 @@ async function productsFromCSV(ctx: any, req: Request) {
     name: `csv=${resolvedUrl} | total=${rows.length} | filtered=${filtered.length} | out=${outRows.length}`,
     weight_grams: null,
     activities: acts.join(","),
-    seasons: seasonHint || rawMonth || "",
+    seasons: seasonHint || month || "",
     url: resolvedUrl,
     image: ""
   };
 
   const mapped = outRows.map(mapCsvRow);
-  const dedup  = dedupeBy(mapped, (p: any) => `${p.category}|${p.name}`).slice(0, 24);
+  const dedup  = dedupeBy(mapped, (p) => `${p.category}|${p.name}`).slice(0, 24);
   return [debugItem, ...dedup];
 }
 
-function splitCsvList(v: any) {
+function splitCsvList(v) {
   if (!v) return [];
   return String(v)
     .split(/[,;]+/)
@@ -759,7 +742,7 @@ function splitCsvList(v: any) {
     .filter(Boolean);
 }
 
-function mapCsvRow(r: any) {
+function mapCsvRow(r) {
   return {
     category: r.category || "",
     name: r.name || "",
@@ -771,9 +754,9 @@ function mapCsvRow(r: any) {
   };
 }
 
-function dedupeBy(arr: any[], keyFn: (x: any) => string) {
-  const seen = new Set<string>();
-  const out: any[] = [];
+function dedupeBy(arr, keyFn) {
+  const seen = new Set();
+  const out = [];
   for (const x of arr) {
     const k = keyFn(x);
     if (!seen.has(k)) { seen.add(k); out.push(x); }
@@ -781,7 +764,7 @@ function dedupeBy(arr: any[], keyFn: (x: any) => string) {
   return out;
 }
 
-async function loadCsvOnce(origin: string) {
+async function loadCsvOnce(origin) {
   const cache = getCsvCache();
   if (cache.rows && Date.now() - cache.at < 1000 * 60 * 10) {
     return cache.rows; // 10 min cache
@@ -802,14 +785,14 @@ async function loadCsvOnce(origin: string) {
   return rows;
 }
 
-function parseCsv(text: string) {
+function parseCsv(text) {
   const lines = text.replace(/\r\n?/g, "\n").split("\n").filter((l) => l.trim().length);
   if (lines.length === 0) return [];
   const headers = splitCsvLine(lines[0]).map((h) => h.trim());
-  const out: any[] = [];
+  const out = [];
   for (let i = 1; i < lines.length; i++) {
     const cells = splitCsvLine(lines[i]);
-    const row: any = {};
+    const row = {};
     headers.forEach((h, idx) => (row[h] = cells[idx] ?? ""));
     if ("weight" in row && !("weight_grams" in row)) row.weight_grams = row.weight;
     out.push(row);
@@ -817,8 +800,8 @@ function parseCsv(text: string) {
   return out;
 }
 
-function splitCsvLine(line: string) {
-  const out: string[] = [];
+function splitCsvLine(line) {
+  const out = [];
   let cur = "";
   let inQ = false;
   for (let i = 0; i < line.length; i++) {
@@ -839,9 +822,9 @@ function splitCsvLine(line: string) {
 
 /* -------------------- OpenAI helpers -------------------- */
 
-function sanitizeHistory(raw: any) {
+function sanitizeHistory(raw) {
   if (!Array.isArray(raw)) return null;
-  const ok: any[] = [];
+  const ok = [];
   for (const m of raw) {
     const role = (m && m.role) || "";
     const content = (m && m.content) || "";
@@ -853,7 +836,7 @@ function sanitizeHistory(raw: any) {
   return ok.length ? ok : null;
 }
 
-async function chatJSON(system: string, user: string, jsonSchema: any) {
+async function chatJSON(system, user, jsonSchema) {
   let res = await fetch(`${OPENAI_API_BASE}/chat/completions`, {
     method: "POST",
     headers: {
@@ -881,8 +864,8 @@ async function chatJSON(system: string, user: string, jsonSchema: any) {
       body: JSON.stringify({
         model: OPENAI_MODEL_JSON,
         messages: [
-          { role: "system", content: "Return ONLY valid JSON, with no text or explanation." },
-          { role: "user", content: `${system}\n\n${user}\n\nAnswer strictly with JSON.` },
+          { role: "system", content: "Geef ALLEEN geldige JSON terug, zonder tekst of uitleg." },
+          { role: "user", content: `${system}\n\n${user}\n\nAntwoord uitsluitend met JSON.` },
         ],
         temperature: 0,
         response_format: { type: "json_object" },
@@ -900,11 +883,11 @@ async function chatJSON(system: string, user: string, jsonSchema: any) {
   try { return JSON.parse(txt); } catch { return {}; }
 }
 
-async function safeErrorText(res: Response) {
+async function safeErrorText(res) {
   try { return (await res.text())?.slice(0, 400); } catch { return ""; }
 }
 
-async function streamOpenAI({ messages, onDelta }: { messages: any[], onDelta: (chunk: string) => void }) {
+async function streamOpenAI({ messages, onDelta }) {
   if (!Array.isArray(messages) || messages.length === 0) {
     throw new Error("Missing messages for OpenAI");
   }
@@ -924,7 +907,7 @@ async function streamOpenAI({ messages, onDelta }: { messages: any[], onDelta: (
   });
   if (!res.ok || !res.body) throw new Error(`OpenAI stream error: ${res.status}`);
 
-  const reader = (res as any).body.getReader();
+  const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
 
@@ -948,10 +931,4 @@ async function streamOpenAI({ messages, onDelta }: { messages: any[], onDelta: (
     }
     buffer = parts[parts.length - 1];
   }
-}
-
-/* -------------------- small utils -------------------- */
-function capitalize(s: string) {
-  if (!s) return s;
-  return s.charAt(0).toUpperCase() + s.slice(1);
 }
