@@ -3,9 +3,11 @@ export const runtime = "edge";
 /**
  * Packlist SSE + Slot-Filling Chat Backend (Edge)
  * ------------------------------------------------
- * Inclusief:
- * - Unknown-friendly generate flow (allowGeneral)
- * - Sterke CORS (met reflectie en zonder credentials bij "*")
+ * NL-code, maar output en gebruikers-IO worden geforceerd naar Engels.
+ * Wijzigingen:
+ * - forceEnglishSystem(): systemregel om ALTIJD in Engels te antwoorden.
+ * - baseSystem eerste regel: schrijft altijd in helder Engels.
+ * - extractSlots(): maanden + duur ondersteunen nu ook Engelse termen.
  */
 
 const OPENAI_API_BASE = "https://api.openai.com/v1";
@@ -36,35 +38,22 @@ function originAllowed(origin = "") {
   });
 }
 
-function buildCorsHeaders(req: Request) {
+function corsHeaders(req: Request) {
   const origin = req.headers.get("origin") || "";
-  const requestACRH = req.headers.get("access-control-request-headers") || "";
   const allowOrigin = originAllowed(origin) ? origin : "*";
-
-  const base: Record<string, string> = {
+  return {
     "Access-Control-Allow-Origin": allowOrigin,
-    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    // sta altijd de gangbare headers toe + protection-bypass
-    "Access-Control-Allow-Headers":
-      requestACRH ||
-      "Content-Type, Authorization, x-session-id, x-vercel-protection-bypass",
-    "Access-Control-Max-Age": "86400",
-    "Vary": "Origin, Access-Control-Request-Headers",
+    "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization, x-session-id",
+    "Access-Control-Allow-Credentials": "true",
   };
-
-  // Alleen credentials toestaan als we een specifieke origin echoën
-  if (allowOrigin !== "*") {
-    base["Access-Control-Allow-Credentials"] = "true";
-  }
-
-  return base;
 }
 
 export async function OPTIONS(req: Request) {
   return new Response(null, {
     status: 204,
     headers: {
-      ...buildCorsHeaders(req),
+      ...corsHeaders(req),
       "Cache-Control": "no-store",
       "Content-Length": "0",
     },
@@ -76,7 +65,7 @@ export async function GET(req: Request) {
     status: 200,
     headers: {
       "Content-Type": "application/json",
-      ...buildCorsHeaders(req),
+      ...corsHeaders(req),
     },
   });
 }
@@ -110,16 +99,18 @@ export async function POST(req: Request) {
       const message = (body?.message || "").trim();
       const hasDirectPrompt = typeof body?.prompt === "string" && body.prompt.trim().length > 0;
 
+      // Conversatiegeschiedenis en hints uit de frontend
       const history = sanitizeHistory(body?.history);
       const nluHints = body?.nluHints || null;
 
       try {
-        /* ---------- Vrije tekst pad (slot-filling) ---------- */
+        // Vrije tekst pad (slot-filling)
         if (!hasDirectPrompt && message) {
           const extracted = await extractSlots({ utterance: message, context: safeContext });
           mergeInto(safeContext, extracted?.context || {});
           const missing = missingSlots(safeContext);
 
+          // Kijk of er taalsignaal is waardoor we níet hoeven te vragen
           const userLower = message.toLowerCase();
           const hasDurationSignal =
             !!nluHints?.durationDays ||
@@ -142,7 +133,7 @@ export async function POST(req: Request) {
             (Array.isArray(safeContext?.activities) && safeContext.activities.length > 0) ||
             hasPeriodSignal || hasDurationSignal;
 
-          // ✅ general unknown flow toegestaan
+          // ✅ Nieuw: expliciet algemene lijst toestaan wanneer alles 'unknown' is
           const allowGeneral =
             safeContext?.unknownCountry === true &&
             safeContext?.unknownPeriod === true &&
@@ -159,6 +150,7 @@ export async function POST(req: Request) {
             return;
           }
 
+          // 👉 Anders: ALTIJD genereren (ook algemene lijst)
           await generateAndStream({
             controller,
             send,
@@ -172,7 +164,7 @@ export async function POST(req: Request) {
           return;
         }
 
-        /* ---------- Wizard back-compat (direct genereren) ---------- */
+        // Wizard back-compat (direct genereren)
         const prompt = hasDirectPrompt ? body.prompt.trim() : buildPromptFromContext(safeContext);
         const missing = missingSlots(safeContext);
 
@@ -183,6 +175,7 @@ export async function POST(req: Request) {
           !!safeContext?.durationDays ||
           !!safeContext?.month || (safeContext?.startDate && safeContext?.endDate);
 
+        // ✅ Nieuw: ook hier algemene lijst toestaan
         const allowGeneral =
           safeContext?.unknownCountry === true &&
           safeContext?.unknownPeriod === true &&
@@ -211,9 +204,8 @@ export async function POST(req: Request) {
     headers: {
       "Content-Type": "text/event-stream; charset=utf-8",
       "Cache-Control": "no-cache, no-transform",
-      // In Edge mag deze er gewoon bij staan; CORS regelt toegestane origins.
       Connection: "keep-alive",
-      ...buildCorsHeaders(req),
+      ...corsHeaders(req),
     },
   });
 }
@@ -252,12 +244,14 @@ function buildPromptFromContext(ctx: any) {
       ? ` Activiteiten: ${ctx.activities.join(", ")}.`
       : "";
   const days = ctx?.durationDays || "?";
+  // Prompt mag NL blijven; forceEnglishSystem zorgt voor Engelstalige output.
   return `Maak een backpack paklijst voor ${days} dagen naar ${where}, ${when}.${acts}`;
 }
 
 /* -------------------- Hybride slot-extractie -------------------- */
 
 async function extractSlots({ utterance, context }: { utterance: string; context: any; }) {
+  // 1) Regex baseline
   const m = (utterance || "").toLowerCase().normalize("NFKD").replace(/[\u0300-\u036f]/g, "");
   const baseline: any = {
     context: {
@@ -271,6 +265,7 @@ async function extractSlots({ utterance, context }: { utterance: string; context
     },
   };
 
+  // Landen (kleine lijst — rest via LLM)
   const COUNTRY = [
     { re: /\bvietnam\b/,                 name: "Vietnam" },
     { re: /\bindonesie|indonesia\b/,     name: "Indonesië" },
@@ -283,15 +278,18 @@ async function extractSlots({ utterance, context }: { utterance: string; context
   const hit = COUNTRY.find(c => c.re.test(m));
   if (hit) baseline.context.destination.country = hit.name;
 
+  // Maand (NL + EN)
   const MONTH = /(januari|februari|maart|april|mei|juni|juli|augustus|september|oktober|november|december|january|february|march|april|may|june|july|august|september|october|november|december)/;
   const mm = m.match(MONTH);
   if (mm) baseline.context.month = mm[1];
 
+  // Duur (NL + EN)
   const dDays = m.match(/(\d{1,3})\s*(dagen|dag|dgn|days?|d)\b/);
   const dWks  = m.match(/(\d{1,2})\s*(weken|weeks?|wk|w)\b/);
   if (dDays) baseline.context.durationDays = Number(dDays[1]);
   else if (dWks) baseline.context.durationDays = Number(dWks[1]) * 7;
 
+  // Datumbereik (optioneel, numeriek)
   const dateRange = m.match(/(\d{1,2})[-\/.](\d{1,2})[-\/.](\d{2,4}).{0,30}?(\d{1,2})[-\/.](\d{1,2})[-\/.](\d{2,4})/);
   if (dateRange) {
     const [, d1, mo1, y1, d2, mo2, y2] = dateRange;
@@ -299,6 +297,7 @@ async function extractSlots({ utterance, context }: { utterance: string; context
     baseline.context.endDate   = toISO(y2, mo2, d2);
   }
 
+  // Activiteiten
   const acts: string[] = [];
   if (/(duik|duiken|snorkel|scuba)/.test(m)) acts.push("duiken");
   if (/(hike|hiken|trek|wandelen|hiking)/.test(m)) acts.push("hiken");
@@ -306,6 +305,7 @@ async function extractSlots({ utterance, context }: { utterance: string; context
   if (/(city|stad|citytrip)/.test(m)) acts.push("citytrip");
   if (acts.length) baseline.context.activities = acts;
 
+  // 2) Optioneel: LLM-verrijking
   if (process.env.OPENAI_API_KEY) {
     try {
       const schema = { type: "object", properties: { context: { type: "object" } }, required: ["context"], additionalProperties: true };
@@ -339,7 +339,7 @@ function mergeInto(target: any, src: any) {
   }
 }
 
-/* -------------------- Vervolgvraag -------------------- */
+/* -------------------- Vervolgvraag (deterministisch) -------------------- */
 
 function followupQuestion({ missing, context }: { missing: string[]; context: any; }) {
   const labels: string[] = [];
@@ -355,7 +355,7 @@ function followupQuestion({ missing, context }: { missing: string[]; context: an
   return `Kun je nog aangeven: ${labels.join(", " )}?${hint}`;
 }
 
-/* -------------------- Afgeleide context -------------------- */
+/* -------------------- Afgeleide context (LLM) -------------------- */
 
 async function derivedContext(ctx: any) {
   const sys =
@@ -368,7 +368,7 @@ async function derivedContext(ctx: any) {
 
 /* -------------------- Seasons CSV integratie -------------------- */
 const SEASONS_CSV_URL = (process.env.SEASONS_CSV_URL || "").trim();
-const SEASONS_TTL_MS = 6 * 60 * 60 * 1000;
+const SEASONS_TTL_MS = 6 * 60 * 60 * 1000; // 6 uur
 const MONTHS_EN = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
 const NL2EN: Record<string,string> = {
   januari:"Jan", februari:"Feb", maart:"Mar", april:"Apr", mei:"May", juni:"Jun",
@@ -392,7 +392,7 @@ async function loadSeasonsTable() {
   if (__SEASONS_CACHE__.rows && Date.now() - __SEASONS_CACHE__.at < SEASONS_TTL_MS) {
     return __SEASONS_CACHE__.rows;
   }
-  const res = await fetch(SEASONS_CSV_URL, { cache: "no-store" } as any);
+  const res = await fetch(SEASONS_CSV_URL, { cache: "no-store" });
   if (!res.ok) return [];
   const text = await res.text();
   const rows = parseCsv(text);
@@ -422,7 +422,7 @@ function normStr(s: any) {
     .trim();
 }
 
-function inSeasonEN(monthAbbrev: string | null, start: string, end: string) {
+function inSeasonEN(monthAbbrev: string|null, start: string, end: string) {
   if (!monthAbbrev || !start || !end) return false;
   const idx = (m: string) => MONTHS_EN.indexOf(m) + 1;
   const m = idx(monthAbbrev), a = idx(start), b = idx(end);
@@ -439,18 +439,18 @@ function computeSeasonInfoForContext(ctx: any, table: any[]) {
   const C = normStr(country);
   const R = normStr(region);
 
-  const hits = table.filter((r: any) => {
+  const hits = table.filter((r) => {
     const rc = normStr(r.country);
     const rr = normStr(r.region);
     const regionMatch = rr ? (rc === C && rr === R) : (rc === C);
     return regionMatch && inSeasonEN(monthAbbrev, r.start_month, r.end_month);
   });
 
-  const climate = hits.find((h: any) => String(h.type).toLowerCase() === "climate")?.label || null;
+  const climate = hits.find(h => String(h.type).toLowerCase() === "climate")?.label || null;
 
   const risks = hits
-    .filter((h: any) => String(h.type).toLowerCase() === "risk")
-    .map((h: any) => ({
+    .filter(h => String(h.type).toLowerCase() === "risk")
+    .map(h => ({
       type: String(h.label || "").toLowerCase(),
       level: String(h.level || "unknown").toLowerCase(),
       note: h.note || ""
@@ -461,14 +461,14 @@ function computeSeasonInfoForContext(ctx: any, table: any[]) {
   for (const h of hits) {
     String(h.advice_flags || "")
       .split(",")
-      .map((s) => s.trim())
+      .map(s => s.trim())
       .filter(Boolean)
-      .forEach((f) => (flags[f] = true));
+      .forEach(f => flags[f] = true);
     String(h.item_tags || "")
       .split(",")
-      .map((s) => s.trim())
+      .map(s => s.trim())
       .filter(Boolean)
-      .forEach((t) => items.add(t));
+      .forEach(t => items.add(t));
   }
 
   return { season: climate, seasonalRisks: risks, adviceFlags: flags, itemTags: Array.from(items) };
@@ -478,21 +478,30 @@ function computeSeasonInfoForContext(ctx: any, table: any[]) {
 
 function seasonPromptLines(seasonsCtx: any) {
   const bits: string[] = [];
-  if (seasonsCtx?.season) bits.push(`Seizoenscontext: ${seasonsCtx.season}.`);
+  if (seasonsCtx?.season) {
+    bits.push(`Seizoenscontext: ${seasonsCtx.season}.`);
+  }
   if (Array.isArray(seasonsCtx?.seasonalRisks) && seasonsCtx.seasonalRisks.length) {
     const top = seasonsCtx.seasonalRisks[0];
     const lvl = top.level ? ` (${top.level})` : "";
     bits.push(`Belangrijke risico's: ${top.type}${lvl}.`);
   }
   if (!bits.length) return [];
-  return [{ role: "system" as const, content: `Gebruik deze seizoenscontext expliciet in de adviezen en paklijst (kleding/gear/health/tips). ${bits.join(" ")}` }];
+  return [
+    {
+      role: "system",
+      content:
+        `Gebruik deze seizoenscontext expliciet in de adviezen en paklijst (kleding/gear/health/tips). ` +
+        bits.join(" "),
+    },
+  ];
 }
 
 /* -------------------- ✨ Prompt policy helpers -------------------- */
 
 function forceEnglishSystem() {
   return {
-    role: "system" as const,
+    role: "system",
     content:
       "You must always write your final answer in clear, natural English. " +
       "Even if the user's message or the prompt is in another language (e.g., Dutch), reply in English only. " +
@@ -514,7 +523,7 @@ function unknownPolicySystem(ctx: any, nluHints: any) {
     "Stel géén vervolgvraag; maak redelijke aannames en benoem ze kort in de tekst.",
     unknowns.length ? `Onbekend gemarkeerd: ${unknowns.join(", ")}.` : "Alle velden lijken bekend; aannames blijven toegestaan.",
   ];
-  return { role: "system" as const, content: lines.join(" ") };
+  return { role: "system", content: lines.join(" ") };
 }
 
 /* -------------------- Generate & Stream -------------------- */
@@ -574,7 +583,7 @@ async function generateAndStream({ controller, send, req, prompt, context, histo
   controller.close();
 }
 
-/* ---------- Context samenvatting ---------- */
+/* ---------- Context samenvatting (inject als system) ---------- */
 function summarizeContext(ctx: any) {
   const parts: string[] = [];
   if (ctx?.destination?.country) parts.push(`land: ${ctx.destination.country}`);
@@ -587,55 +596,67 @@ function summarizeContext(ctx: any) {
   return `Bekende context (${parts.join(" • ")}). Gebruik dit impliciet bij je advies als het relevant is.`;
 }
 
-/* ---------- Bouw OpenAI messages ---------- */
+/* ---------- Bouw OpenAI messages (met nieuwe promptpolicy) ---------- */
 function buildMessagesForOpenAI({ systemExtras = [], prompt, history, contextSummary, lastUserMessage, nluHints, _ctx }: any) {
   const baseSystem = {
-    role: "system" as const,
+    role: "system",
     content: [
       "Je schrijft altijd in helder Engels, direct en zonder disclaimers of excuses.",
       "Gebruik deze secties in onderstaande volgorde: Korte samenvatting, Kleding, Gear, Gadgets, Health, Tips.",
       "De eerste paragraaf is een verhalende, menselijke intro (2–4 zinnen) die de situatie van de gebruiker samenvat en aannames transparant benoemt.",
-      "Behandel land, periode, duur en activiteiten als optioneel. Als iets ontbreekt of ‘onbekend’ is: ga door, maak redelijke aannames, en benoem die kort.",
-      "Normaliseer spelfouten en varianten.",
-      "Als activiteiten onbekend zijn: basislijst + optionele modules.",
-      "Als duur onbekend is: uitbreidingen per extra week.",
-      "Als periode onbekend is: scenario’s warm/koel/nat.",
-      "Als land onbekend is: klimaat-agnostisch advies.",
-      "Gebruik seizoenscontext als die aanwezig is.",
-      "Wees concreet en beknopt. Bullets in secties; geen codeblokken of tabellen."
+      "Behandel land, periode, duur en activiteiten als optioneel. Als iets ontbreekt of ‘onbekend’ is: ga door, maak redelijke aannames, en benoem die kort (‘Als je naar warm/vochtig gebied gaat…’, ‘Bij winter…’, ‘Per extra week…’). Stel geen vervolgvraag in plaats van een antwoord.",
+      "Normaliseer spelfouten en varianten (‘miss’→‘misschien’, ‘mexcio’→‘Mexico’, ‘paar weekjes’≈14 dagen, ‘rond de jaarwisseling’≈20 dec–10 jan).",
+      "Als activiteiten onbekend zijn: bied een basislijst + optionele modules (hiken, stad, strand, duiken, etc.).",
+      "Als duur onbekend is: geef een minimale kernlijst en voeg uitbreidingen per extra week toe (bijv. +3 T-shirts, +1 onderkleding per 3–4 dagen).",
+      "Als periode onbekend is: geef scenario’s voor warm/heet, koel/koud en nat (regen) met korte aanwijzingen per scenario.",
+      "Als land onbekend is: geef klimaat-agnostische adviezen en varieer waar nodig per klimaat.",
+      "Als er seizoenscontext is meegegeven: gebruik die expliciet in advies en in de secties.",
+      "Eventuele machineleesbare hints (seasonalRisks, adviceFlags, itemTags, geïnterpreteerde velden) horen via een apart kanaal te gaan; plaats GEEN JSON in de hoofdtekst.",
+      "Wees concreet en beknopt. Gebruik bullets in secties; geen lange lijstjes met irrelevante items. Geen codeblokken, geen tabellen."
     ].join("\n")
   };
 
   const policyUnknown = unknownPolicySystem(_ctx, nluHints);
 
   const approxSystem = (nluHints?.policy?.allowApproximate || nluHints?.durationPhrase || nluHints?.periodPhrase)
-    ? [{ role: "system" as const, content: "Je mag vage tijdsaanduidingen interpreteren; vul ontbrekende velden in zonder door te vragen." }]
-    : [{ role: "system" as const, content: "Interpreteer vage tijdsaanduidingen zonder door te vragen." }];
+    ? [{
+        role: "system",
+        content:
+          "Je mag vage tijdsaanduidingen interpreteren. Voorbeelden: ‘paar maanden’≈60–90 dagen (kies 90 bij twijfel), ‘rond de jaarwisseling’≈20 dec–10 jan. " +
+          "Vul ontbrekende velden in zonder opnieuw te vragen; vraag alleen door bij echte ambiguïteit (niet van toepassing wanneer velden als onbekend zijn gemarkeerd)."
+      }]
+    : [{
+        role: "system",
+        content:
+          "Vage tijdsaanduidingen mag je interpreteren: ‘paar weekjes’≈14 dagen, ‘rond de jaarwisseling’≈20 dec–10 jan. " +
+          "Vul ontbrekende velden in zonder door te vragen."
+      }];
 
   const fewShot = [{
-    role: "system" as const,
+    role: "system",
     content: [
       "Voorbeeld interpretaties:",
-      "- 'ik ga miss mexcio paar weekjes over 2 mnd' → Mexico; ~14 dagen; vertrek ~2 maanden.",
-      "- 'rond de jaarwisseling naar japan' → ~20 dec–10 jan; Japan."
+      "- User: 'ik ga miss mexcio paar weekjes over 2 mnd' → Normaliseer: land=Mexico; duur≈14 dagen; vertrek≈over 2 maanden.",
+      "- User: 'rond de jaarwisseling naar japan' → Periode≈20 dec–10 jan; land=Japan."
     ].join("\n")
   }];
 
-  const extras = (systemExtras || []).map((m: any) => ({ role: "system" as const, content: m.content || m }));
-  const ctxMsg = contextSummary ? [{ role: "system" as const, content: contextSummary }] : [];
+  const extras = (systemExtras || []).map((m: any) => ({ role: "system", content: m.content || m }));
+  const ctxMsg = contextSummary ? [{ role: "system", content: contextSummary }] : [];
+
   const english = [forceEnglishSystem()];
 
   if (history && history.length) {
     const hist = history.map((m: any) => ({ role: m.role, content: String(m.content || "").slice(0, 8000) }));
-    const tail = lastUserMessage ? [{ role: "user" as const, content: String(lastUserMessage).slice(0, 8000) }] : [];
+    const tail = lastUserMessage ? [{ role: "user", content: String(lastUserMessage).slice(0, 8000) }] : [];
     return [...english, policyUnknown, ...fewShot, ...approxSystem, ...extras, baseSystem, ...ctxMsg, ...hist, ...tail];
   }
 
-  return [...english, policyUnknown, ...fewShot, ...approxSystem, ...extras, baseSystem, ...ctxMsg, { role: "user" as const, content: prompt }];
+  return [...english, policyUnknown, ...fewShot, ...approxSystem, ...extras, baseSystem, ...ctxMsg, { role: "user", content: prompt }];
 }
 
 /* -------------------- CSV producten -------------------- */
-const CSV_PUBLIC_PATH = "/pack_products.csv";
+const CSV_PUBLIC_PATH = "/pack_products.csv"; // fallback-pad
 
 function resolveCsvUrl(origin: string) {
   const url = (process.env.PRODUCTS_CSV_URL && String(process.env.PRODUCTS_CSV_URL).trim()) || "";
@@ -749,11 +770,11 @@ function dedupeBy<T>(arr: T[], keyFn: (x: T) => string) {
 async function loadCsvOnce(origin: string) {
   const cache = getCsvCache();
   if (cache.rows && Date.now() - cache.at < 1000 * 60 * 10) {
-    return cache.rows;
+    return cache.rows; // 10 min cache
   }
 
   const url = resolveCsvUrl(origin);
-  const res = await fetch(url, { cache: "no-store" } as any);
+  const res = await fetch(url, { cache: "no-store" });
   if (!res.ok) throw new Error(`CSV fetch failed ${res.status} @ ${url}`);
 
   const text = await res.text();
@@ -809,7 +830,7 @@ function sanitizeHistory(raw: any) {
   const ok: any[] = [];
   for (const m of raw) {
     const role = (m && m.role) || "";
-    the content = (m && m.content) || "";
+    const content = (m && m.content) || "";
     if (!content) continue;
     if (role !== "user" && role !== "assistant") continue;
     ok.push({ role, content: String(content).slice(0, 8000) });
@@ -856,7 +877,7 @@ async function chatJSON(system: string, user: string, jsonSchema: any) {
   }
 
   if (!res.ok) {
-    const err = await safeErrorText(res);
+    const err = await safeErrorText(res as any);
     throw new Error(`OpenAI json error: ${res.status}${err ? ` — ${err}` : ""}`);
   }
 
