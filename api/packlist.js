@@ -14,6 +14,7 @@ const OPENAI_API_BASE = "https://api.openai.com/v1";
 const OPENAI_MODEL_TEXT = process.env.OPENAI_MODEL_TEXT || "gpt-4o-mini";
 const OPENAI_MODEL_JSON = process.env.OPENAI_MODEL_JSON || "gpt-4o-mini";
 const enc = new TextEncoder();
+const ALWAYS_GENERATE = true; // forceer altijd genereren, nooit blokkeren
 
 /* --------------------------- CORS helpers --------------------------- */
 
@@ -133,16 +134,17 @@ export async function POST(req) {
             (Array.isArray(safeContext?.activities) && safeContext.activities.length > 0) ||
             hasPeriodSignal || hasDurationSignal;
 
-          if (allHardMissing && !hasAnySignal) {
-            const followupQ = followupQuestion({ missing, context: safeContext });
-            send("needs", { missing, contextOut: extracted?.context || {} });
-            const derived = await derivedContext(safeContext);
-            const seasonsCtx = await seasonsContextFor(safeContext);
-            send("ask", { question: followupQ, missing });
-            send("context", { ...derived, ...seasonsCtx });
-            controller.close();
-            return;
-          }
+  if (!ALWAYS_GENERATE && allHardMissing && !hasAnySignal) {
+  const followupQ = followupQuestion({ missing, context: safeContext });
+  send("needs", { missing, contextOut: extracted?.context || {} });
+  const derived = await derivedContext(safeContext);
+  const seasonsCtx = await seasonsContextFor(safeContext);
+  send("ask", { question: followupQ, missing });
+  send("context", { ...derived, ...seasonsCtx });
+  controller.close();
+  return;
+}
+
 
           // 👉 Anders: ALTIJD genereren
           await generateAndStream({
