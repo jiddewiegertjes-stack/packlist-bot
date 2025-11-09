@@ -8,6 +8,10 @@ export const runtime = "edge";
  * - forceEnglishSystem(): systemregel om ALTIJD in Engels te antwoorden.
  * - baseSystem eerste regel: schrijft altijd in helder Engels.
  * - extractSlots(): maanden + duur ondersteunen nu ook Engelse termen.
+ * - ✅ NIEUW: evaluateAnswersLLM() & evaluateQASet(): LLM analyseert of user-antwoord bruikbare info bevat
+ *              voor 4 vragen (bestemming, duur, periode, activiteiten) en extraheert normaliseerde waarden.
+ * - ✅ NIEUW: mergeQaIntoContext() en deriveHintsFromQa(): mergen van detectie in context + nluHints
+ * - ✅ NIEUW: SSE event "qa" met de gevonden velden/zekerheden per vraag
  */
 
 const OPENAI_API_BASE = "https://api.openai.com/v1";
@@ -100,89 +104,92 @@ export async function POST(req) {
       const message = (body?.message || "").trim();
       const hasDirectPrompt = typeof body?.prompt === "string" && body.prompt.trim().length > 0;
 
+      // Vrije-tekst invulvelden (optioneel) voor de 4 vragen
+      // { destination?: string, duration?: string, period?: string, activities?: string }
+      const qaInput = (body?.qaInput && typeof body.qaInput === "object") ? body.qaInput : null;
+
       // Conversatiegeschiedenis en hints uit de frontend
       const history = sanitizeHistory(body?.history);
-      const nluHints = body?.nluHints || null;
+      let nluHints = body?.nluHints || null;
 
       try {
-        // Vrije tekst pad (slot-filling)
+        /* ---------- ✨ NIEUW: LLM-analyse voor 4 vragen ---------- */
+        // 1) Als er een qaInput object is (wizard), analyseer die eerst
+        if (qaInput && hasAnyNonEmptyString(qaInput)) {
+          const qaFromForm = await evaluateQASet(qaInput);
+          if (qaFromForm) {
+            send("qa", { source: "form", ...qaFromForm });
+            mergeQaIntoContext(safeContext, qaFromForm);
+            nluHints = deriveHintsFromQa(qaFromForm, nluHints);
+          }
+        }
+
+        // 2) Als er losse vrije tekst is, analyseer ook die
+        if (!hasDirectPrompt && message) {
+          const qaFromUtterance = await evaluateAnswersLLM(message);
+          if (qaFromUtterance) {
+            send("qa", { source: "utterance", ...qaFromUtterance });
+            mergeQaIntoContext(safeContext, qaFromUtterance);
+            nluHints = deriveHintsFromQa(qaFromUtterance, nluHints);
+          }
+        }
+
+        // 3) Bestaande hybride slot-extractie (regex + optionele LLM-verrijking)
         if (!hasDirectPrompt && message) {
           const extracted = await extractSlots({ utterance: message, context: safeContext });
           mergeInto(safeContext, extracted?.context || {});
-          const missing = missingSlots(safeContext);
-
-          // Kijk of er taalsignaal is waardoor we níet hoeven te vragen
-          const userLower = message.toLowerCase();
-          const hasDurationSignal =
-            !!nluHints?.durationDays ||
-            !!nluHints?.durationPhrase ||
-            /\b(weekje|maandje|paar\s*weken|paar\s*maanden|few\s*weeks|few\s*months)\b/.test(userLower);
-          const hasPeriodSignal =
-            !!nluHints?.month ||
-            !!nluHints?.startDate ||
-            !!nluHints?.periodPhrase ||
-            /\brond\s+de\s+jaarwisseling|rond\s+kerst|oud.*nieuw\b/.test(userLower);
-
-          const HARD_MISS = ["destination.country", "durationDays", "period"];
-          const allHardMissing = HARD_MISS.every(f => missing.includes(f));
-          const hasAnySignal =
-            !!nluHints?.durationDays ||
-            !!nluHints?.month ||
-            !!nluHints?.startDate ||
-            !!safeContext?.destination?.country ||
-            !!safeContext?.durationDays ||
-            (Array.isArray(safeContext?.activities) && safeContext.activities.length > 0) ||
-            hasPeriodSignal || hasDurationSignal;
-
-  if (!ALWAYS_GENERATE && allHardMissing && !hasAnySignal) {
-  const followupQ = followupQuestion({ missing, context: safeContext });
-  send("needs", { missing, contextOut: extracted?.context || {} });
-  const derived = await derivedContext(safeContext);
-  const seasonsCtx = await seasonsContextFor(safeContext);
-  send("ask", { question: followupQ, missing });
-  send("context", { ...derived, ...seasonsCtx });
-  controller.close();
-  return;
-}
-
-
-          // 👉 Anders: ALTIJD genereren
-          await generateAndStream({
-            controller,
-            send,
-            req,
-            prompt: buildPromptFromContext(safeContext),
-            context: safeContext,
-            history,
-            lastUserMessage: message,
-            nluHints,
-          });
-          return;
         }
 
-        // Wizard back-compat (direct genereren)
-        const prompt = hasDirectPrompt ? body.prompt.trim() : buildPromptFromContext(safeContext);
         const missing = missingSlots(safeContext);
+
+        // Signalen om "toch genereren" te doen ook als hard-miss
+        const userLower = message.toLowerCase?.() || "";
+        const hasDurationSignal =
+          !!nluHints?.durationDays ||
+          !!nluHints?.durationPhrase ||
+          /\b(weekje|maandje|paar\s*weken|paar\s*maanden|few\s*weeks|few\s*months)\b/.test(userLower);
+        const hasPeriodSignal =
+          !!nluHints?.month ||
+          !!nluHints?.startDate ||
+          !!nluHints?.periodPhrase ||
+          /\brond\s+de\s+jaarwisseling|rond\s+kerst|oud.*nieuw\b/.test(userLower);
 
         const HARD_MISS = ["destination.country", "durationDays", "period"];
         const allHardMissing = HARD_MISS.every(f => missing.includes(f));
         const hasAnySignal =
+          !!nluHints?.durationDays ||
+          !!nluHints?.month ||
+          !!nluHints?.startDate ||
           !!safeContext?.destination?.country ||
           !!safeContext?.durationDays ||
-          !!safeContext?.month || (safeContext?.startDate && safeContext?.endDate);
+          (Array.isArray(safeContext?.activities) && safeContext.activities.length > 0) ||
+          hasPeriodSignal || hasDurationSignal;
 
-        if (!hasDirectPrompt && allHardMissing && !hasAnySignal) {
+        // Als ALTIJD_GENEREREN = false en echt niets bekend, dan vragen
+        if (!ALWAYS_GENERATE && allHardMissing && !hasAnySignal) {
           const followupQ = followupQuestion({ missing, context: safeContext });
+          send("needs", { missing, contextOut: {} });
           const derived = await derivedContext(safeContext);
           const seasonsCtx = await seasonsContextFor(safeContext);
-          send("needs", { missing, contextOut: {} });
           send("ask", { question: followupQ, missing });
           send("context", { ...derived, ...seasonsCtx });
           controller.close();
           return;
         }
 
-        await generateAndStream({ controller, send, req, prompt, context: safeContext, history, nluHints });
+        // 👉 Anders: ALTIJD genereren
+        const prompt = hasDirectPrompt ? body.prompt.trim() : buildPromptFromContext(safeContext);
+
+        await generateAndStream({
+          controller,
+          send,
+          req,
+          prompt,
+          context: safeContext,
+          history,
+          lastUserMessage: message,
+          nluHints,
+        });
       } catch (e) {
         closeWithError(e?.message || "Onbekende fout");
       }
@@ -238,17 +245,241 @@ function buildPromptFromContext(ctx) {
   return `Maak een backpack paklijst voor ${days} dagen naar ${where}, ${when}.${acts}`;
 }
 
+/* -------------------- ✨ NIEUW: LLM QA-extractie -------------------- */
+
+/** Checkt of object tenminste één niet-lege string bevat */
+function hasAnyNonEmptyString(obj) {
+  return Object.values(obj).some(v => typeof v === "string" && v.trim().length > 0);
+}
+
+/** LLM-evaluatie voor losse utterance; markeert of bruikbare info aanwezig is per vraag */
+async function evaluateAnswersLLM(utterance) {
+  if (!process.env.OPENAI_API_KEY || !utterance || typeof utterance !== "string") return null;
+
+  const sys =
+    "Je taak: lees 1 user-utterance en bepaal of er bruikbare informatie staat voor vier reisinvoer-velden: " +
+    "(destination, duration, period, activities). Normaliseer naar compacte, machineleesbare velden. " +
+    "Wees strikt: zet hasInfo=false als het niet expliciet of zeer aannemelijk is. Antwoord ALLEEN als JSON.";
+
+  const user =
+    `Utterance: "${utterance}"\n` +
+    "Definities:\n" +
+    "- destination: land en optioneel regio/streek/stad.\n" +
+    "- duration: totaal aantal dagen (schatting toestaan bij 'paar weekjes'≈14d, 'few weeks'≈14d, '2-3 weken'≈17-21→kies 21 bij twijfel).\n" +
+    "- period: ofwel maandnaam (NL/EN) of concreet startDate/endDate (YYYY-MM-DD). Bij 'rond de jaarwisseling'≈20 dec–10 jan.\n" +
+    "- activities: lijst met woorden (hiking, surfing, diving, citytrip, etc.).\n" +
+    "Let op: Vul ook 'phrase' velden als ruwe tekstindicatie nuttig is.";
+
+  const schema = {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      destination: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          hasInfo: { type: "boolean" },
+          country: { type: ["string", "null"] },
+          region:  { type: ["string", "null"] },
+          evidence:{ type: ["string", "null"] }
+        },
+        required: ["hasInfo","country","region","evidence"]
+      },
+      duration: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          hasInfo: { type: "boolean" },
+          durationDays: { type: ["integer","null"] },
+          phrase: { type: ["string","null"] },
+          evidence:{ type: ["string","null"] }
+        },
+        required: ["hasInfo","durationDays","phrase","evidence"]
+      },
+      period: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          hasInfo: { type: "boolean" },
+          month: { type: ["string","null"] },
+          startDate: { type: ["string","null"] },
+          endDate: { type: ["string","null"] },
+          phrase: { type: ["string","null"] },
+          evidence:{ type: ["string","null"] }
+        },
+        required: ["hasInfo","month","startDate","endDate","phrase","evidence"]
+      },
+      activities: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          hasInfo: { type: "boolean" },
+          list: { type: "array", items: { type: "string" } },
+          evidence:{ type: ["string","null"] }
+        },
+        required: ["hasInfo","list","evidence"]
+      }
+    },
+    required: ["destination","duration","period","activities"]
+  };
+
+  try {
+    const json = await chatJSON(sys, user, schema);
+    return json;
+  } catch {
+    return null;
+  }
+}
+
+/** LLM-evaluatie voor wizard/form: vier losse velden tegelijk */
+async function evaluateQASet(qaInput) {
+  if (!process.env.OPENAI_API_KEY) return null;
+
+  const { destination = "", duration = "", period = "", activities = "" } = qaInput || {};
+  if (![destination, duration, period, activities].some(s => typeof s === "string" && s.trim())) return null;
+
+  const sys =
+    "Lees vier user-invoer strings (destination, duration, period, activities). " +
+    "Bepaal per veld of er bruikbare info in staat en extraheer genormaliseerde waarden. " +
+    "Antwoord ALLEEN als JSON volgens schema.";
+
+  const user =
+    `destination="${destination || ""}"\n` +
+    `duration="${duration || ""}"\n` +
+    `period="${period || ""}"\n` +
+    `activities="${activities || ""}"\n` +
+    "Regels: duration in dagen, period als maand of start/end datum, activities als lijst. " +
+    "Wees strikt met hasInfo; vul phrase en evidence waar zinnig.";
+
+  // Zelfde schema als evaluateAnswersLLM
+  const schema = {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      destination: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          hasInfo: { type: "boolean" },
+          country: { type: ["string","null"] },
+          region:  { type: ["string","null"] },
+          evidence:{ type: ["string","null"] }
+        },
+        required: ["hasInfo","country","region","evidence"]
+      },
+      duration: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          hasInfo: { type: "boolean" },
+          durationDays: { type: ["integer","null"] },
+          phrase: { type: ["string","null"] },
+          evidence:{ type: ["string","null"] }
+        },
+        required: ["hasInfo","durationDays","phrase","evidence"]
+      },
+      period: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          hasInfo: { type: "boolean" },
+          month: { type: ["string","null"] },
+          startDate: { type: ["string","null"] },
+          endDate: { type: ["string","null"] },
+          phrase: { type: ["string","null"] },
+          evidence:{ type: ["string","null"] }
+        },
+        required: ["hasInfo","month","startDate","endDate","phrase","evidence"]
+      },
+      activities: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          hasInfo: { type: "boolean" },
+          list: { type: "array", items: { type: "string" } },
+          evidence:{ type: ["string","null"] }
+        },
+        required: ["hasInfo","list","evidence"]
+      }
+    },
+    required: ["destination","duration","period","activities"]
+  };
+
+  try {
+    const json = await chatJSON(sys, user, schema);
+    return json;
+  } catch {
+    return null;
+  }
+}
+
+/** Merge QA-resultaten naar context */
+function mergeQaIntoContext(ctx, qa) {
+  if (!ctx || !qa) return;
+
+  // Destination
+  if (qa.destination?.hasInfo) {
+    ctx.destination = ctx.destination || {};
+    if (qa.destination.country) ctx.destination.country = qa.destination.country;
+    if (qa.destination.region)  ctx.destination.region  = qa.destination.region;
+  }
+
+  // Duration
+  if (qa.duration?.hasInfo && Number.isFinite(qa.duration.durationDays || null)) {
+    ctx.durationDays = qa.duration.durationDays;
+  }
+
+  // Period
+  if (qa.period?.hasInfo) {
+    if (qa.period.month) {
+      ctx.month = qa.period.month;
+      ctx.startDate = ctx.startDate || null;
+      ctx.endDate   = ctx.endDate   || null;
+    } else if (qa.period.startDate && qa.period.endDate) {
+      ctx.startDate = qa.period.startDate;
+      ctx.endDate   = qa.period.endDate;
+      ctx.month     = null;
+    }
+  }
+
+  // Activities
+  if (qa.activities?.hasInfo && Array.isArray(qa.activities.list)) {
+    const normActs = qa.activities.list.map(s => String(s).toLowerCase().trim()).filter(Boolean);
+    const merged = new Set([...(ctx.activities || []), ...normActs]);
+    ctx.activities = Array.from(merged);
+  }
+}
+
+/** Afgeleide hints voor flow-heuristieken */
+function deriveHintsFromQa(qa, hintsIn) {
+  const hints = Object.assign({}, hintsIn || {});
+  if (!qa) return hints;
+
+  if (qa.duration?.hasInfo) {
+    if (Number.isFinite(qa.duration.durationDays)) hints.durationDays = qa.duration.durationDays;
+    if (qa.duration.phrase) hints.durationPhrase = qa.duration.phrase;
+  }
+  if (qa.period?.hasInfo) {
+    if (qa.period.month) hints.month = qa.period.month;
+    if (qa.period.startDate) hints.startDate = qa.period.startDate;
+    if (qa.period.endDate) hints.endDate = qa.period.endDate;
+    if (qa.period.phrase) hints.periodPhrase = qa.period.phrase;
+  }
+  if (qa.destination?.hasInfo) {
+    if (qa.destination.country) hints.country = qa.destination.country;
+    if (qa.destination.region) hints.region = qa.destination.region;
+  }
+  if (qa.activities?.hasInfo && Array.isArray(qa.activities.list)) {
+    hints.activities = qa.activities.list;
+  }
+  return hints;
+}
+
 /* -------------------- Hybride slot-extractie -------------------- */
 
-/* -------------------- Hybride slot-extractie (regex + LLM fallback) -------------------- */
-import OpenAI from "openai";
-const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-
 async function extractSlots({ utterance, context }) {
-  const m = (utterance || "")
-    .toLowerCase()
-    .normalize("NFKD")
-    .replace(/[\u0300-\u036f]/g, "");
+  // 1) Regex baseline
+  const m = (utterance || "").toLowerCase().normalize("NFKD").replace(/[\u0300-\u036f]/g, "");
   const baseline = {
     context: {
       durationDays: null,
@@ -260,95 +491,6 @@ async function extractSlots({ utterance, context }) {
       preferences: null,
     },
   };
-
-  /* ---------- 1. Regex baseline ---------- */
-
-  // Landen (kleine lijst — rest via LLM)
-  const COUNTRY = [
-    { re: /\bvietnam\b/, name: "Vietnam" },
-    { re: /\bindonesie|indonesia\b/, name: "Indonesië" },
-    { re: /\bthailand\b/, name: "Thailand" },
-    { re: /\bmaleisie|malaysia\b/, name: "Maleisië" },
-    { re: /\bfilipijnen|philippines\b/, name: "Filipijnen" },
-    { re: /\blaos\b/, name: "Laos" },
-    { re: /\bcambodja|cambodia\b/, name: "Cambodja" },
-  ];
-  const hit = COUNTRY.find((c) => c.re.test(m));
-  if (hit) baseline.context.destination.country = hit.name;
-
-  // Maand (NL + EN)
-  const MONTH =
-    /(januari|februari|maart|april|mei|juni|juli|augustus|september|oktober|november|december|january|february|march|april|may|june|july|august|september|october|november|december)/;
-  const mm = m.match(MONTH);
-  if (mm) baseline.context.month = mm[1];
-
-  // Duur (NL + EN)
-  const dDays = m.match(/(\d{1,3})\s*(dagen|dag|dgn|days?|d)\b/);
-  const dWks = m.match(/(\d{1,2})\s*(weken|weeks?|wk|w)\b/);
-  if (dDays) baseline.context.durationDays = Number(dDays[1]);
-  else if (dWks) baseline.context.durationDays = Number(dWks[1]) * 7;
-
-  // Datumbereik
-  const dateRange = m.match(
-    /(\d{1,2})[-\/.](\d{1,2})[-\/.](\d{2,4}).{0,30}?(\d{1,2})[-\/.](\d{1,2})[-\/.](\d{2,4})/
-  );
-  if (dateRange) {
-    const [, d1, mo1, y1, d2, mo2, y2] = dateRange;
-    baseline.context.startDate = toISO(y1, mo1, d1);
-    baseline.context.endDate = toISO(y2, mo2, d2);
-  }
-
-  // Activiteiten
-  const acts = [];
-  if (/(duik|duiken|snorkel|scuba)/.test(m)) acts.push("diving");
-  if (/(hike|hiken|trek|wandelen|hiking)/.test(m)) acts.push("hiking");
-  if (/(surf|surfen|surfing)/.test(m)) acts.push("surfing");
-  if (/(city|stad|citytrip)/.test(m)) acts.push("citytrip");
-  if (acts.length) baseline.context.activities = acts;
-
-  /* ---------- 2. LLM fallback voor ontbrekende velden ---------- */
-  const missing = [];
-  if (!baseline.context.destination.country) missing.push("country");
-  if (!baseline.context.durationDays) missing.push("duration");
-  if (!baseline.context.month && !baseline.context.startDate)
-    missing.push("period");
-  if (!baseline.context.activities.length) missing.push("activities");
-
-  if (process.env.OPENAI_API_KEY && missing.length) {
-    try {
-      const prompt = `
-You are a travel context extraction assistant.
-From this user message, infer the following fields if possible:
-- destination.country (the country name)
-- durationDays (in days)
-- period (month, or date range)
-- activities (comma-separated list)
-
-Return valid JSON in English:
-{ "destination": { "country": string|null }, "durationDays": number|null, "month": string|null, "startDate": string|null, "endDate": string|null, "activities": string[] }
-
-Message: "${utterance}"
-      `;
-
-      const res = await client.responses.create({
-        model: "gpt-4o-mini",
-        input: prompt,
-      });
-
-      const txt = res.output_text.trim();
-      try {
-        const parsed = JSON.parse(txt);
-        mergeInto(baseline.context, parsed);
-      } catch {
-        console.warn("LLM fallback parse failed:", txt);
-      }
-    } catch (err) {
-      console.error("LLM fallback extraction failed:", err);
-    }
-  }
-
-  return baseline;
-}
 
   // Landen (kleine lijst — rest via LLM)
   const COUNTRY = [
