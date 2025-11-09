@@ -1,5 +1,3 @@
-Ik denk dat je het nog niet hebt begrepen, ik wil dat je al deze aanpassingen integreet in deze code: 
-
 export const runtime = "edge";
 
 /**
