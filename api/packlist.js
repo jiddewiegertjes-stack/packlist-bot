@@ -240,9 +240,15 @@ function buildPromptFromContext(ctx) {
 
 /* -------------------- Hybride slot-extractie -------------------- */
 
+/* -------------------- Hybride slot-extractie (regex + LLM fallback) -------------------- */
+import OpenAI from "openai";
+const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
 async function extractSlots({ utterance, context }) {
-  // 1) Regex baseline
-  const m = (utterance || "").toLowerCase().normalize("NFKD").replace(/[\u0300-\u036f]/g, "");
+  const m = (utterance || "")
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "");
   const baseline = {
     context: {
       durationDays: null,
@@ -254,6 +260,95 @@ async function extractSlots({ utterance, context }) {
       preferences: null,
     },
   };
+
+  /* ---------- 1. Regex baseline ---------- */
+
+  // Landen (kleine lijst — rest via LLM)
+  const COUNTRY = [
+    { re: /\bvietnam\b/, name: "Vietnam" },
+    { re: /\bindonesie|indonesia\b/, name: "Indonesië" },
+    { re: /\bthailand\b/, name: "Thailand" },
+    { re: /\bmaleisie|malaysia\b/, name: "Maleisië" },
+    { re: /\bfilipijnen|philippines\b/, name: "Filipijnen" },
+    { re: /\blaos\b/, name: "Laos" },
+    { re: /\bcambodja|cambodia\b/, name: "Cambodja" },
+  ];
+  const hit = COUNTRY.find((c) => c.re.test(m));
+  if (hit) baseline.context.destination.country = hit.name;
+
+  // Maand (NL + EN)
+  const MONTH =
+    /(januari|februari|maart|april|mei|juni|juli|augustus|september|oktober|november|december|january|february|march|april|may|june|july|august|september|october|november|december)/;
+  const mm = m.match(MONTH);
+  if (mm) baseline.context.month = mm[1];
+
+  // Duur (NL + EN)
+  const dDays = m.match(/(\d{1,3})\s*(dagen|dag|dgn|days?|d)\b/);
+  const dWks = m.match(/(\d{1,2})\s*(weken|weeks?|wk|w)\b/);
+  if (dDays) baseline.context.durationDays = Number(dDays[1]);
+  else if (dWks) baseline.context.durationDays = Number(dWks[1]) * 7;
+
+  // Datumbereik
+  const dateRange = m.match(
+    /(\d{1,2})[-\/.](\d{1,2})[-\/.](\d{2,4}).{0,30}?(\d{1,2})[-\/.](\d{1,2})[-\/.](\d{2,4})/
+  );
+  if (dateRange) {
+    const [, d1, mo1, y1, d2, mo2, y2] = dateRange;
+    baseline.context.startDate = toISO(y1, mo1, d1);
+    baseline.context.endDate = toISO(y2, mo2, d2);
+  }
+
+  // Activiteiten
+  const acts = [];
+  if (/(duik|duiken|snorkel|scuba)/.test(m)) acts.push("diving");
+  if (/(hike|hiken|trek|wandelen|hiking)/.test(m)) acts.push("hiking");
+  if (/(surf|surfen|surfing)/.test(m)) acts.push("surfing");
+  if (/(city|stad|citytrip)/.test(m)) acts.push("citytrip");
+  if (acts.length) baseline.context.activities = acts;
+
+  /* ---------- 2. LLM fallback voor ontbrekende velden ---------- */
+  const missing = [];
+  if (!baseline.context.destination.country) missing.push("country");
+  if (!baseline.context.durationDays) missing.push("duration");
+  if (!baseline.context.month && !baseline.context.startDate)
+    missing.push("period");
+  if (!baseline.context.activities.length) missing.push("activities");
+
+  if (process.env.OPENAI_API_KEY && missing.length) {
+    try {
+      const prompt = `
+You are a travel context extraction assistant.
+From this user message, infer the following fields if possible:
+- destination.country (the country name)
+- durationDays (in days)
+- period (month, or date range)
+- activities (comma-separated list)
+
+Return valid JSON in English:
+{ "destination": { "country": string|null }, "durationDays": number|null, "month": string|null, "startDate": string|null, "endDate": string|null, "activities": string[] }
+
+Message: "${utterance}"
+      `;
+
+      const res = await client.responses.create({
+        model: "gpt-4o-mini",
+        input: prompt,
+      });
+
+      const txt = res.output_text.trim();
+      try {
+        const parsed = JSON.parse(txt);
+        mergeInto(baseline.context, parsed);
+      } catch {
+        console.warn("LLM fallback parse failed:", txt);
+      }
+    } catch (err) {
+      console.error("LLM fallback extraction failed:", err);
+    }
+  }
+
+  return baseline;
+}
 
   // Landen (kleine lijst — rest via LLM)
   const COUNTRY = [
