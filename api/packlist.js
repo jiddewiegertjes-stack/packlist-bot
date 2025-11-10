@@ -744,7 +744,7 @@ async function generateAndStream({ controller, send, req, prompt, context, histo
     const products = await productsFromCSV(context, req);
     if (Array.isArray(products) && products.length) {
       const batch = 6;
-      for (let i = 0; i < Math.min(products.length, 24); i += batch) {
+      for (let i = 0; i < Math.min(products.length, 50); i += batch) {
         send("products", products.slice(i, i + batch));
       }
     }
