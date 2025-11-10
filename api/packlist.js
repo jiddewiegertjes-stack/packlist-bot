@@ -744,7 +744,7 @@ async function generateAndStream({ controller, send, req, prompt, context, histo
     const products = await productsFromCSV(context, req);
     if (Array.isArray(products) && products.length) {
       const batch = 6;
-      for (let i = 0; i < Math.min(products.length, 50); i += batch) {
+      for (let i = 0; i < Math.min(products.length, 100); i += batch) {
         send("products", products.slice(i, i + batch));
       }
     }
@@ -957,7 +957,7 @@ async function productsFromCSV(ctx, req) {
   });
 
   const mapped = selected.map(({ row }) => mapCsvRow(row));
-  const dedup  = dedupeBy(mapped, (p) => `${p.category}|${p.name}`).slice(0, 24);
+  const dedup  = dedupeBy(mapped, (p) => `${p.category}|${p.name}`).slice(0, 48);
 
   const debugItem = {
     category: "DEBUG",
