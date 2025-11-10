@@ -957,7 +957,7 @@ async function productsFromCSV(ctx, req) {
   });
 
   const mapped = selected.map(({ row }) => mapCsvRow(row));
-  const dedup  = dedupeBy(mapped, (p) => `${p.category}|${p.name}`).slice(0, 48);
+  const dedup  = dedupeBy(mapped, (p) => `${p.category}|${p.name}`).slice(0, 72);
 
   const debugItem = {
     category: "DEBUG",
