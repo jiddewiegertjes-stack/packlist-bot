@@ -5,7 +5,7 @@ export const runtime = "edge";
  * ---------------------------------------------------------
  * - Output en gebruikers-IO geforceerd naar Engels.
  * - CSV komt uit PRODUCTS_CSV_URL (Google Sheets URL wordt automatisch naar CSV export omgezet).
- * - Producten gefilterd op activiteiten/maand/seizoen. Batchwise via SSE "products".
+ * - Producten: generiek ALTIJD tonen + extra’s op basis van activiteiten (NL/EN synoniemen).
  */
 
 const OPENAI_API_BASE = "https://api.openai.com/v1";
@@ -853,10 +853,63 @@ function getCsvCache() {
   return globalThis.__PACKLIST_CSV__;
 }
 
+/* ---------- Activities NL/EN normalisatie ---------- */
+
+const ACT_SYNONYMS = {
+  surfing: ["surf", "surfen", "surfing"],
+  hiking: ["hike", "hiken", "wandelen", "trek", "trekking", "hiking"],
+  diving: ["duik", "duiken", "scuba", "diving", "snorkel", "snorkeling"],
+  city: ["city", "stad", "citytrip", "urban"],
+  camping: ["camping", "kamperen"],
+  snow: ["snow", "ski", "skiën", "skien", "snowboard", "winterspor"],
+  swimming: ["zwem", "zwemmen", "swim"],
+  running: ["hardlopen", "run", "running"],
+  climbing: ["klim", "klimmen", "climb", "climbing", "boulder", "boulderen"],
+};
+
+function norm(s) {
+  return String(s || "")
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .trim();
+}
+
+function tokenizeCsvList(v) {
+  if (!v) return [];
+  return String(v)
+    .split(/[,;|/]+/)
+    .map((s) => norm(s))
+    .filter(Boolean);
+}
+
+function canonActivity(tok) {
+  const t = norm(tok);
+  for (const [canon, syns] of Object.entries(ACT_SYNONYMS)) {
+    if (syns.some((w) => t.includes(w))) return canon;
+  }
+  return t;
+}
+
+function canonActivities(list) {
+  const set = new Set();
+  for (const t of list) {
+    const c = canonActivity(t);
+    if (c) set.add(c);
+  }
+  return set; // Set<canon>
+}
+
+function anyIntersect(aSet, bSet) {
+  for (const a of aSet) if (bSet.has(a)) return true;
+  return false;
+}
+
 async function productsFromCSV(ctx, req) {
   const origin = new URL(req.url).origin;
   const resolvedUrl = resolveCsvUrl(origin);
 
+  // Load CSV once (cached)
   let rows;
   try {
     rows = await loadCsvOnce(origin);
@@ -872,60 +925,51 @@ async function productsFromCSV(ctx, req) {
     }];
   }
 
-  const acts  = (ctx?.activities || []).map((s) => String(s).toLowerCase());
-  const month = (ctx?.month || "").toLowerCase();
+  // Context → canon activities
+  const ctxActs = canonActivities((ctx?.activities || []).map(String));
 
-  let seasonHint = "";
-  if (["december","januari","februari"].includes(month)) seasonHint = "winter";
-  else if (["juni","juli","augustus"].includes(month))   seasonHint = "zomer";
+  // Score & select: generiek ALTIJD mee, activity-match als extra
+  const scored = rows.map((r) => {
+    const prodActsArr = tokenizeCsvList(r.activities);
+    const prodActs = canonActivities(prodActsArr);
+    const isGeneric = prodActs.size === 0 || prodActs.has("alle") || prodActs.has("generic");
+    const matchesActivity = ctxActs.size > 0 && anyIntersect(prodActs, ctxActs);
 
-  const filtered = rows.filter((r) => {
-    const prodActs    = splitCsvList(r.activities);
-    const prodSeasons = splitCsvList(r.seasons);
+    // score: activity-match boven generiek; lichter gewicht eerst bij gelijke score
+    let score = 0;
+    if (matchesActivity) score += 2;
+    if (isGeneric) score += 0;
 
-    const actsOk =
-      prodActs.length === 0 ||
-      acts.some((a) => prodActs.includes(a));
+    const weight =
+      Number(String(r.weight_grams ?? r.weight ?? "").toString().replace(",", ".")) || 999999;
 
-    const seasonOk =
-      prodSeasons.length === 0 ||
-      prodSeasons.includes("alle") ||
-      (seasonHint && prodSeasons.includes(seasonHint)) ||
-      (month && prodSeasons.includes(month));
-
-    return actsOk && seasonOk;
+    return { row: r, score, isGeneric, matchesActivity, weight };
   });
 
-  let outRows = filtered;
-  if (outRows.length === 0) {
-    outRows = rows.filter((r) => {
-      const a = splitCsvList(r.activities).length === 0;
-      const s = splitCsvList(r.seasons);
-      return a && (s.length === 0 || s.includes("alle"));
-    });
-  }
+  // Filter: alleen meenemen als generiek OF activity-match
+  const selected = scored.filter(s => s.isGeneric || s.matchesActivity);
+
+  // Sort: eerst activity-matches (hoogste score), dan generiek; binnen groep lichtste eerst, dan naam
+  selected.sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score;
+    if (a.weight !== b.weight) return a.weight - b.weight;
+    return String(a.row.name || "").localeCompare(String(b.row.name || ""));
+  });
+
+  const mapped = selected.map(({ row }) => mapCsvRow(row));
+  const dedup  = dedupeBy(mapped, (p) => `${p.category}|${p.name}`).slice(0, 24);
 
   const debugItem = {
     category: "DEBUG",
-    name: `csv=${resolvedUrl} | total=${rows.length} | filtered=${filtered.length} | out=${outRows.length}`,
+    name: `csv=${resolvedUrl} | total=${rows.length} | ctxActs=${[...ctxActs].join(",")} | out=${dedup.length} (activity+generic)`,
     weight_grams: null,
-    activities: acts.join(","),
-    seasons: seasonHint || month || "",
+    activities: "",
+    seasons: "",
     url: resolvedUrl,
     image: ""
   };
 
-  const mapped = outRows.map(mapCsvRow);
-  const dedup  = dedupeBy(mapped, (p) => `${p.category}|${p.name}`).slice(0, 24);
   return [debugItem, ...dedup];
-}
-
-function splitCsvList(v) {
-  if (!v) return [];
-  return String(v)
-    .split(/[,;]+/)
-    .map((s) => s.trim().toLowerCase())
-    .filter(Boolean);
 }
 
 function mapCsvRow(r) {
@@ -1095,7 +1139,7 @@ async function streamOpenAI({ messages, onDelta }) {
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
-
+  
   while (true) {
     const { value, done } = await reader.read();
     if (done) break;
