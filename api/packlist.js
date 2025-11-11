@@ -6,6 +6,9 @@ export const runtime = "edge";
  * - Output en gebruikers-IO geforceerd naar Engels.
  * - CSV komt uit PRODUCTS_CSV_URL (Google Sheets URL wordt automatisch naar CSV export omgezet).
  * - Producten: generiek ALTIJD tonen + extra’s op basis van activiteiten (NL/EN synoniemen).
+ * - ✨ Updates:
+ *   - Meerdere landen via context.destinations[] (prompt + seizoenscontext + missingSlots).
+ *   - Rationale-tekst als vroeg SSE-event ("rationale") o.b.v. landen + seizoen + duur.
  */
 
 const OPENAI_API_BASE = "https://api.openai.com/v1";
@@ -196,8 +199,11 @@ export async function POST(req) {
 
 /* -------------------- Context helpers -------------------- */
 
+// ✨ UPDATED: ondersteunt nu context.destinations[] en back-compat met context.destination
 function normalizeContext(ctx = {}) {
   const c = typeof ctx === "object" && ctx ? structuredClone(ctx) : {};
+
+  // bestaande velden
   c.destination = c.destination || {};
   if (c.activities && !Array.isArray(c.activities)) {
     c.activities = String(c.activities)
@@ -206,29 +212,49 @@ function normalizeContext(ctx = {}) {
       .filter(Boolean);
   }
   ensureKeys(c, ["durationDays", "startDate", "endDate", "month", "preferences"]);
+
+  // nieuw: meervoudige landen
+  if (!Array.isArray(c.destinations)) c.destinations = [];
+  // back-compat: promote enkelvoud naar array als array leeg is
+  if (c.destination?.country && c.destinations.length === 0) {
+    c.destinations = [{ country: c.destination.country, region: c.destination.region || null }];
+  }
+
   ensureKeys(c.destination, ["country", "region"]);
   c.activities = Array.isArray(c.activities) ? c.activities : [];
   return c;
 }
 function ensureKeys(o, keys) { for (const k of keys) if (!(k in o)) o[k] = null; }
 
+// ✨ UPDATED: land mag nu óók uit destinations[] komen
 function missingSlots(ctx) {
   const missing = [];
-  if (!ctx?.destination?.country) missing.push("destination.country");
+  const hasAnyCountry =
+    (ctx?.destination?.country) ||
+    (Array.isArray(ctx?.destinations) && ctx.destinations.some(d => d?.country));
+  if (!hasAnyCountry) missing.push("destination.country");
   if (!ctx?.durationDays || ctx.durationDays < 1) missing.push("durationDays");
   if (!ctx?.month && !(ctx?.startDate && ctx?.endDate)) missing.push("period");
   return missing;
 }
 
+// ✨ UPDATED: prompt noemt nu meerdere landen in 1 zin
 function buildPromptFromContext(ctx) {
-  const where = [ctx?.destination?.country, ctx?.destination?.region].filter(Boolean).join(" - ") || "?";
+  const legs = Array.isArray(ctx?.destinations) && ctx.destinations.length
+    ? ctx.destinations
+    : (ctx?.destination?.country ? [ctx.destination] : []);
+
+  const where = legs.length
+    ? legs.map(l => [l.country, l.region].filter(Boolean).join(" - ")).join(", ")
+    : "?";
+
   const when = ctx?.month ? `in ${ctx.month}` : `${ctx?.startDate || "?"} t/m ${ctx?.endDate || "?"}`;
   const acts =
     Array.isArray(ctx?.activities) && ctx.activities.length
       ? ` Activiteiten: ${ctx.activities.join(", ")}.`
       : "";
   const days = ctx?.durationDays || "?";
-  return `Maak een backpack paklijst voor ${days} dagen naar ${where}, ${when}.${acts}`;
+  return `Maak een backpack paklijst voor ${days} dagen langs ${where}, ${when}.${acts}`;
 }
 
 /* -------------------- LLM QA-extractie -------------------- */
@@ -402,6 +428,10 @@ function mergeQaIntoContext(ctx, qa) {
     ctx.destination = ctx.destination || {};
     if (qa.destination.country) ctx.destination.country = qa.destination.country;
     if (qa.destination.region)  ctx.destination.region  = qa.destination.region;
+    // ✨ align met destinations[]
+    if (!Array.isArray(ctx.destinations)) ctx.destinations = [];
+    const first = { country: ctx.destination.country || null, region: ctx.destination.region || null };
+    if (first.country && ctx.destinations.length === 0) ctx.destinations = [first];
   }
   if (qa.duration?.hasInfo && Number.isFinite(qa.duration.durationDays || null)) {
     ctx.durationDays = qa.duration.durationDays;
@@ -569,12 +599,50 @@ const NL2EN = {
 };
 let __SEASONS_CACHE__ = { rows: null, at: 0 };
 
+// ✨ UPDATED: merge seizoensinfo over meerdere landen (destinations[])
 async function seasonsContextFor(ctx) {
   try {
     const tbl = await loadSeasonsTable();
     if (!tbl || !tbl.length) return {};
-    const out = computeSeasonInfoForContext(ctx, tbl);
-    return out || {};
+    const legs = (Array.isArray(ctx?.destinations) && ctx.destinations.length)
+      ? ctx.destinations
+      : (ctx?.destination?.country ? [ctx.destination] : []);
+
+    if (!legs.length) return {};
+
+    const merged = { season: null, seasonalRisks: [], adviceFlags: {}, itemTags: [] };
+
+    for (const leg of legs) {
+      const legCtx = {
+        ...ctx,
+        destination: { country: leg.country || null, region: leg.region || null },
+        month: leg.month || ctx.month || null,
+        startDate: leg.startDate || ctx.startDate || null,
+        endDate: leg.endDate || ctx.endDate || null,
+      };
+      const out = computeSeasonInfoForContext(legCtx, tbl);
+      if (!out) continue;
+
+      if (!merged.season && out.season) merged.season = out.season;
+
+      if (Array.isArray(out.seasonalRisks)) merged.seasonalRisks.push(...out.seasonalRisks);
+      Object.assign(merged.adviceFlags, out.adviceFlags || {});
+      if (Array.isArray(out.itemTags)) merged.itemTags.push(...out.itemTags);
+    }
+
+    // dedupe
+    const dedupBy = (arr, key) => {
+      const seen = new Set(); const out = [];
+      for (const x of arr || []) {
+        const k = key(x);
+        if (!seen.has(k)) { seen.add(k); out.push(x); }
+      }
+      return out;
+    };
+    merged.seasonalRisks = dedupBy(merged.seasonalRisks, r => `${r.type}|${r.level||""}|${r.note||""}`);
+    merged.itemTags = Array.from(new Set(merged.itemTags));
+
+    return merged;
   } catch {
     return {};
   }
@@ -710,11 +778,44 @@ function unknownPolicySystem(ctx, nluHints) {
 
 /* -------------------- Generate & Stream -------------------- */
 
+// ✨ Helpers voor rationale
+function listCountries(ctx) {
+  const legs = (ctx?.destinations && ctx.destinations.length)
+    ? ctx.destinations
+    : (ctx?.destination?.country ? [ctx.destination] : []);
+  const names = legs.map(l => l?.country).filter(Boolean);
+  return Array.from(new Set(names)).join(", ");
+}
+
+function generateRationale(ctx, seasonsCtx) {
+  const countries = listCountries(ctx) || "unknown country";
+  const days = ctx?.durationDays ? `${ctx.durationDays} days` : "an unspecified duration";
+  const season = seasonsCtx?.season || null;
+
+  const reasons = [];
+  if (seasonsCtx?.adviceFlags?.rain) reasons.push("rain protection");
+  if (seasonsCtx?.adviceFlags?.mosquito) reasons.push("mosquito prevention");
+  if (seasonsCtx?.adviceFlags?.sun) reasons.push("sun exposure");
+  if ((seasonsCtx?.itemTags || []).includes("humidity")) reasons.push("humidity & quick-dry fabrics");
+
+  const because = reasons.length ? ` We prioritized ${reasons.join(", ")} based on seasonal conditions.` : "";
+  const seasonBit = season ? ` during ${season}` : "";
+
+  return `Tailored for ${countries}${seasonBit}, for ${days}.${because}`;
+}
+
 async function generateAndStream({ controller, send, req, prompt, context, history, lastUserMessage, nluHints }) {
   const derived = await derivedContext(context);
   const seasonsCtx = await seasonsContextFor(context);
 
+  // zend seizoenscontext zoals voorheen
   send("context", { ...derived, ...seasonsCtx });
+
+  // ✨ nieuw: zend rationale vroeg in de stream
+  try {
+    const rationaleText = generateRationale(context, seasonsCtx);
+    if (rationaleText) send("rationale", { text: rationaleText });
+  } catch {}
 
   const systemExtras = seasonPromptLines(seasonsCtx);
 
@@ -769,6 +870,10 @@ function summarizeContext(ctx) {
   const parts = [];
   if (ctx?.destination?.country) parts.push(`land: ${ctx.destination.country}`);
   if (ctx?.destination?.region) parts.push(`regio: ${ctx.destination.region}`);
+  if (Array.isArray(ctx?.destinations) && ctx.destinations.length) {
+    const countries = Array.from(new Set(ctx.destinations.map(d => d.country).filter(Boolean)));
+    if (countries.length) parts.push(`landen: ${countries.join(", ")}`);
+  }
   if (ctx?.durationDays) parts.push(`duur: ${ctx.durationDays} dagen`);
   if (ctx?.month) parts.push(`maand: ${ctx.month}`);
   if (ctx?.startDate && ctx?.endDate) parts.push(`data: ${ctx.startDate} t/m ${ctx.endDate}`);
