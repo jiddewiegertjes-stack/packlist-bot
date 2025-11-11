@@ -1081,11 +1081,20 @@ function mapCsvRow(r) {
   return {
     category: r.category || "",
     name: r.name || "",
-    weight_grams: r.weight_grams ? Number(String(r.weight_grams).replace(",", ".")) : null,
+    weight_grams: r.weight_grams
+      ? Number(String(r.weight_grams).replace(",", "."))
+      : null,
     activities: r.activities || "",
     seasons: r.seasons || "",
     url: r.url || "",
     image: r.image || "",
+
+    // 🔹 geef de prioriteit mee (verschillende mogelijke kolomnamen)
+    priority: r.priority ?? r.prio ?? r.importance ?? r.tier ?? r.priority_level ?? "",
+    // (optioneel) booleans als je die ooit in de CSV zet:
+    must_have: r.must_have ?? r.musthave ?? "",
+    should_have: r.should_have ?? r.shouldhave ?? "",
+    nice_to_have: r.nice_to_have ?? r.nicetohave ?? "",
   };
 }
 
