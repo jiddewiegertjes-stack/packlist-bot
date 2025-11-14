@@ -868,21 +868,26 @@ async function generateTripSummary(ctx, seasonsCtx, history) {
         .join("\n")
     : "";
 
-  const messages = [
+    const messages = [
     forceEnglishSystem(),
     {
       role: "system",
       content:
-        "You write short, vivid travel mini-narratives. Describe the trip itself, not a packing list. " +
-        "Return exactly one paragraph, 3–6 sentences, 70–140 words. " +
-        "Do NOT include headings, bullet points or explicit advice. Just describe what the trip will roughly feel like. " +
-        "Weave in the traveller’s style, budget, accommodation and work situation naturally into the story."
+        "You write short, vivid trip summaries in clear, natural English.\n" +
+        "- Always write in the SECOND person (‘you’, ‘your trip’). Never use ‘I’ or ‘we’.\n" +
+        "- Tone: warm, enthusiastic and motivating – it should make the reader excited about their own trip.\n" +
+        "- Output: exactly ONE paragraph, 4–6 sentences, roughly 70–140 words.\n" +
+        "- Describe the experience of the trip: what the days feel like, typical moments, atmosphere, and vibe.\n" +
+        "- Briefly weave in travel style, budget, accommodation and work situation as context, not as a dry list.\n" +
+        "- If there is seasonal or climate information, explicitly mention why that period is special (e.g. less rain, green rice fields, cooler evenings).\n" +
+        "- Never mention packing, packing lists, gear, checklists, or advice.\n" +
+        "- Do not add a title or headings."
     },
     {
       role: "user",
       content:
-        `Create a narrative description of this backpacking trip.\n\n` +
-        `Structured facts:\n` +
+        `Write an exciting, second-person summary of this backpacking trip.\n\n` +
+        `Facts about the trip:\n` +
         `- Destinations: ${countries}\n` +
         `- Duration: ${days}\n` +
         `- Period: ${period}\n` +
@@ -893,11 +898,11 @@ async function generateTripSummary(ctx, seasonsCtx, history) {
         `- Work mode: ${workModeLabel}\n` +
         `${seasonLine ? `- ${seasonLine}\n` : ""}` +
         (convoSnippet
-          ? `\nConversation snippet (tone & extra hints, do NOT quote literally):\n${convoSnippet}\n`
+          ? `\nExtra hints from the conversation (do NOT quote literally, only use as inspiration):\n${convoSnippet}\n`
           : "") +
-        "\nWrite from the traveller’s perspective. Focus on what their days roughly look like, how the trip feels, " +
-        "and how their style/budget/accommodation/work situation shape the experience. " +
-        "Do not mention packing, packing lists, gear lists or checklists. Do not add a title."
+        "\nStart with something like “Your trip to … in …” or “On your trip you…” and then describe what their days roughly look like, " +
+        "why this period in these destinations is special (e.g. weather, landscape, atmosphere), and how their style/budget/accommodation/work situation shape the experience. " +
+        "Write as if you are talking directly to them about their own upcoming adventure."
     }
   ];
 
