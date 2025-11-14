@@ -804,6 +804,71 @@ function generateRationale(ctx, seasonsCtx) {
   return `Tailored for ${countries}${seasonBit}, for ${days}.${because}`;
 }
 
+async function generateTripSummary(ctx, seasonsCtx) {
+  if (!process.env.OPENAI_API_KEY) return null;
+
+  const countries = listCountries(ctx) || "an unknown destination";
+  const days = ctx?.durationDays
+    ? `${ctx.durationDays} days`
+    : "an open-ended amount of time";
+  const period = ctx?.month
+    ? `in ${ctx.month}`
+    : (ctx?.startDate && ctx?.endDate)
+      ? `from ${ctx.startDate} to ${ctx.endDate}`
+      : "at an unspecified time of year";
+  const activities = Array.isArray(ctx?.activities) && ctx.activities.length
+    ? ctx.activities.join(", ")
+    : "no specific activities yet";
+  const seasonLine = seasonsCtx?.season
+    ? `Seasonal context: ${seasonsCtx.season}.`
+    : "";
+
+  const messages = [
+    forceEnglishSystem(),
+    {
+      role: "system",
+      content:
+        "You write short, vivid travel mini-narratives. Describe the trip itself, not a packing list. " +
+        "Return exactly one paragraph, 3–6 sentences, 50–120 words. " +
+        "Do NOT include headings, bullet points or explicit advice. Just describe what the trip will roughly feel like."
+    },
+    {
+      role: "user",
+      content:
+        `Create a 50–120 word narrative description of this backpacking trip.\n` +
+        `Destinations: ${countries}\n` +
+        `Duration: ${days}\n` +
+        `Period: ${period}\n` +
+        `Activities: ${activities}\n` +
+        `${seasonLine}\n` +
+        "Focus on the experience of travelling and what the person will roughly be doing. " +
+        "Do not mention packing, packing lists, gear lists or checklists. Do not add a title."
+    }
+  ];
+
+  const res = await fetch(`${OPENAI_API_BASE}/chat/completions`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: OPENAI_MODEL_TEXT,
+      temperature: 0.7,
+      messages,
+    }),
+  });
+
+  if (!res.ok) {
+    const err = await safeErrorText(res);
+    throw new Error(`OpenAI tripSummary error: ${res.status}${err ? ` — ${err}` : ""}`);
+  }
+
+  const j = await res.json();
+  const txt = j?.choices?.[0]?.message?.content || "";
+  return txt.trim();
+}
+
 async function generateAndStream({ controller, send, req, prompt, context, history, lastUserMessage, nluHints }) {
   const derived = await derivedContext(context);
   const seasonsCtx = await seasonsContextFor(context);
@@ -811,7 +876,17 @@ async function generateAndStream({ controller, send, req, prompt, context, histo
   // zend seizoenscontext zoals voorheen
   send("context", { ...derived, ...seasonsCtx });
 
-  // ✨ nieuw: zend rationale vroeg in de stream
+  // ✨ nieuw: trip-verhaal (LLM) zo vroeg mogelijk uitsturen
+  try {
+    const summaryText = await generateTripSummary(context, seasonsCtx);
+    if (summaryText) {
+      send("tripSummary", { text: summaryText });
+    }
+  } catch (e) {
+    // stil falen – we willen de rest van de stream niet breken
+  }
+
+  // ✨ bestaand: rationale voor intern debug/extra context
   try {
     const rationaleText = generateRationale(context, seasonsCtx);
     if (rationaleText) send("rationale", { text: rationaleText });
