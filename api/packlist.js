@@ -857,9 +857,6 @@ async function generateTripSummary(ctx, seasonsCtx, history) {
         "- Do NOT mention packing, gear, lists, or advice.\n" +
         "- No bullets, no headings, no lists."
     },
-async function generateTripSummary(ctx, seasonsCtx, history) {
-  ... veel code ...
-}
 
 /*  ⬇️⬇️⬇️ PUNT 2: HIER TOEVOEGEN ⬇️⬇️⬇️ */
 async function generateSeasonAdvice(ctx, seasonsCtx) {
