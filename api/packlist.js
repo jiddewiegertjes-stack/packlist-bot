@@ -807,56 +807,77 @@ function generateRationale(ctx, seasonsCtx) {
 async function generateTripSummary(ctx, seasonsCtx, history) {
   if (!process.env.OPENAI_API_KEY) return null;
 
-  // ---- Extract input data -------------------------------------
   const countries = listCountries(ctx) || "an unknown destination";
-  const days = ctx?.durationDays
-    ? `${ctx.durationDays} days`
-    : "an open-ended duration";
+  const days = ctx?.durationDays ? `${ctx.durationDays} days` : "an open-ended duration";
 
   const period = ctx?.month
     ? `in ${ctx.month}`
     : (ctx?.startDate && ctx?.endDate)
-      ? `from ${ctx.startDate} to ${ctx.endDate}`
-      : "at an unspecified time of year";
+        ? `from ${ctx.startDate} to ${ctx.endDate}`
+        : "at an unspecified time of year";
 
   const activities = Array.isArray(ctx?.activities) && ctx.activities.length
     ? ctx.activities.join(", ")
     : null;
 
   const prefs = ctx?.preferences || {};
-
-  const travelStyleLabel = prefs?.travelStyle || "";
-  const budgetLabel = prefs?.budgetLevel || "";
-  const accommodationLabel = prefs?.accommodation || "";
-  const workModeLabel = prefs?.workMode || "";
+  const travelStyleLabel = prefs.travelStyle || "";
+  const budgetLabel = prefs.budgetLevel || "";
+  const accommodationLabel = prefs.accommodation || "";
+  const workModeLabel = prefs.workMode || "";
   const seasonLine = seasonsCtx?.season || "";
 
   const convoSnippet = Array.isArray(history)
-    ? history
-        .slice(-8)
-        .filter((m) => m.role === "user")
-        .map((m) => m.content)
-        .join("\n")
+    ? history.slice(-8).filter(m => m.role === "user").map(m => m.content).join("\n")
     : "";
 
-  // ---- PROMPT (Option 5 style, optimized) ----------------------
   const messages = [
     {
       role: "system",
       content:
         "You create short, concrete, second-person trip summaries that feel directly tailored to the user’s situation.\n" +
         "Tone & style:\n" +
-        "- Informative, grounded, specific, and practical.\n" +
-        "- Warm and human, but NOT poetic or abstract.\n" +
-        "- Subtle personalization is required—show clearly that the summary reflects *their* input.\n\n" +
-        "Rules:\n" +
-        "- ALWAYS write in the second person ('you', 'your trip'). Never use 'I' or 'we'.\n" +
-        "- One paragraph, 3–4 sentences, ~60–90 words.\n" +
-        "- Be concise and concrete: describe the climate, seasonal feel, regions that fit their plan, and how their choices shape the experience.\n" +
-        "- Light directional suggestions are allowed (e.g., typical regions for certain activities).\n" +
-        "- Do NOT mention packing, gear, lists, or advice.\n" +
-        "- No bullets, no headings, no lists."
+        "- Informative and grounded.\n" +
+        "- No poetry. No lists."
     },
+    {
+      role: "user",
+      content:
+        `Write a concise, personalized second-person trip summary.\n\n` +
+        `Destinations: ${countries}\n` +
+        `Duration: ${days}\n` +
+        `Period: ${period}\n` +
+        `${activities ? `Activities: ${activities}\n` : ""}` +
+        `${travelStyleLabel ? `Travel style: ${travelStyleLabel}\n` : ""}` +
+        `${budgetLabel ? `Budget: ${budgetLabel}\n` : ""}` +
+        `${accommodationLabel ? `Accommodation: ${accommodationLabel}\n` : ""}` +
+        `${workModeLabel ? `Work mode: ${workModeLabel}\n` : ""}` +
+        `${seasonLine ? `Season context: ${seasonLine}\n` : ""}` +
+        (convoSnippet ? `Conversation hints: ${convoSnippet}` : "")
+    }
+  ];
+
+  const res = await fetch(`${OPENAI_API_BASE}/chat/completions`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: OPENAI_MODEL_TEXT,
+      temperature: 0.65,
+      messages,
+    }),
+  });
+
+  if (!res.ok) {
+    const err = await safeErrorText(res);
+    throw new Error(`OpenAI tripSummary error: ${res.status}${err ? ` — ${err}` : ""}`);
+  }
+
+  const j = await res.json();
+  return j?.choices?.[0]?.message?.content?.trim() || null;
+}
 
 /*  ⬇️⬇️⬇️ PUNT 2: HIER TOEVOEGEN ⬇️⬇️⬇️ */
 async function generateSeasonAdvice(ctx, seasonsCtx) {
