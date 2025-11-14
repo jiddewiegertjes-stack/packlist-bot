@@ -807,59 +807,30 @@ function generateRationale(ctx, seasonsCtx) {
 async function generateTripSummary(ctx, seasonsCtx, history) {
   if (!process.env.OPENAI_API_KEY) return null;
 
-  // --- Extract structured context ---
+  // ---- Extract input data -------------------------------------
   const countries = listCountries(ctx) || "an unknown destination";
   const days = ctx?.durationDays
     ? `${ctx.durationDays} days`
     : "an open-ended duration";
+
   const period = ctx?.month
     ? `in ${ctx.month}`
     : (ctx?.startDate && ctx?.endDate)
       ? `from ${ctx.startDate} to ${ctx.endDate}`
       : "at an unspecified time of year";
+
   const activities = Array.isArray(ctx?.activities) && ctx.activities.length
     ? ctx.activities.join(", ")
-    : "no specific activities listed";
+    : null;
 
   const prefs = ctx?.preferences || {};
 
-  const travelStyleLabel = prefs?.travelStyle
-    ? {
-        ultralight: "an ultralight style",
-        light: "a light and flexible style",
-        comfort: "a comfort-focused style",
-        luxury: "a more luxurious approach",
-      }[prefs.travelStyle] || prefs.travelStyle
-    : "no specific travel style";
+  const travelStyleLabel = prefs?.travelStyle || "";
+  const budgetLabel = prefs?.budgetLevel || "";
+  const accommodationLabel = prefs?.accommodation || "";
+  const workModeLabel = prefs?.workMode || "";
+  const seasonLine = seasonsCtx?.season || "";
 
-  const budgetLabel = prefs?.budgetLevel
-    ? {
-        low: "a budget-friendly mindset",
-        mid: "a mid-range spending style",
-        high: "a higher-end budget",
-      }[prefs.budgetLevel] || prefs.budgetLevel
-    : "no clear budget preference";
-
-  const accommodationLabel = prefs?.accommodation
-    ? {
-        hostels: "a preference for social hostels",
-        hotels: "a preference for hotels or guesthouses",
-        mixed: "a mix of hostels and simple hotels",
-      }[prefs.accommodation] || prefs.accommodation
-    : "no accommodation preference";
-
-  const workModeLabel = prefs?.workMode
-    ? {
-        travel_only: "purely traveling for leisure",
-        travel_plus_work: "travel combined with remote work",
-      }[prefs.workMode] || prefs.workMode
-    : "no work/holiday preference";
-
-  const seasonLine = seasonsCtx?.season
-    ? `Seasonal context: ${seasonsCtx.season}.`
-    : "";
-
-  // Snippet from previous chat (helps personalization)
   const convoSnippet = Array.isArray(history)
     ? history
         .slice(-8)
@@ -868,52 +839,74 @@ async function generateTripSummary(ctx, seasonsCtx, history) {
         .join("\n")
     : "";
 
-  // --- PROMPT MESSAGE SET (new, improved, “social proof” style) ---
+  // ---- PROMPT (Option 5 style, optimized) ----------------------
   const messages = [
     {
       role: "system",
       content:
-        "You create short, vivid, second-person travel summaries that feel highly personalized.\n" +
-        "Tone:\n" +
-        "- Warm, enthusiastic, motivating, emotionally engaging.\n" +
-        "- Make the reader feel truly understood and excited about their own trip.\n\n" +
-        "Writing rules:\n" +
-        "- ALWAYS write in the SECOND person ('you', 'your trip'). Never use 'I', 'me', or 'we'.\n" +
-        "- Output exactly ONE paragraph of 4–6 sentences (70–140 words).\n" +
-        "- Describe what the reader’s days will FEEL like: atmosphere, rhythm, landscapes, people, energy.\n" +
-        "- Subtly weave in the user’s actual input: destinations, timing, activities, travel style, budget, accommodation, work mode.\n" +
-        "- Use PERSONALIZATION explicitly but naturally:\n" +
-        "  e.g., 'Since you're traveling in July...', 'Because you prefer hostels...', 'Given your plan to surf...'\n" +
-        "- Highlight what is special about that timing/season if possible.\n" +
-        "- Never list inputs mechanically or in bullet points.\n" +
-        "- Never mention packing, gear, lists, or advice.\n" +
-        "- No titles, no headings."
+        "You create short, concrete, second-person trip summaries that feel directly tailored to the user’s situation.\n" +
+        "Tone & style:\n" +
+        "- Informative, grounded, specific, and practical.\n" +
+        "- Warm and human, but NOT poetic or abstract.\n" +
+        "- Subtle personalization is required—show clearly that the summary reflects *their* input.\n\n" +
+        "Rules:\n" +
+        "- ALWAYS write in the second person ('you', 'your trip'). Never use 'I' or 'we'.\n" +
+        "- One paragraph, 3–4 sentences, ~60–90 words.\n" +
+        "- Be concise and concrete: describe the climate, seasonal feel, regions that fit their plan, and how their choices shape the experience.\n" +
+        "- Light directional suggestions are allowed (e.g., typical regions for certain activities).\n" +
+        "- Do NOT mention packing, gear, lists, or advice.\n" +
+        "- No bullets, no headings, no lists."
     },
 
     {
       role: "user",
       content:
-        `Write a highly personalized, exciting second-person summary of this trip.\n\n` +
-        `Trip facts for inspiration:\n` +
+        `Write a concise, personalized second-person trip summary using the user’s input.\n\n` +
+        `Trip details:\n` +
         `- Destinations: ${countries}\n` +
         `- Duration: ${days}\n` +
         `- Period: ${period}\n` +
-        `- Activities: ${activities}\n` +
-        `- Travel style: ${travelStyleLabel}\n` +
-        `- Budget: ${budgetLabel}\n` +
-        `- Accommodation: ${accommodationLabel}\n` +
-        `- Work mode: ${workModeLabel}\n` +
-        `${seasonLine ? "- " + seasonLine + "\n" : ""}` +
+        `${activities ? `- Activities: ${activities}\n` : ""}` +
+        `${travelStyleLabel ? `- Travel style: ${travelStyleLabel}\n` : ""}` +
+        `${budgetLabel ? `- Budget: ${budgetLabel}\n` : ""}` +
+        `${accommodationLabel ? `- Accommodation: ${accommodationLabel}\n` : ""}` +
+        `${workModeLabel ? `- Work mode: ${workModeLabel}\n` : ""}` +
+        `${seasonLine ? `- Season context: ${seasonLine}\n` : ""}` +
         (convoSnippet
-          ? `\nAdditional hints from the conversation (do NOT quote literally, just use the vibe):\n${convoSnippet}\n`
+          ? `\nConversation hints (do NOT quote literally):\n${convoSnippet}\n`
           : "") +
         "\nYour goal:\n" +
-        "- Make the paragraph clearly feel tailored to THIS user's situation.\n" +
-        "- Show (subtly) that the trip's atmosphere, timing, and style are shaped by their preferences.\n" +
-        "- Describe what their experience will FEEL like — emotionally, visually, energetically.\n" +
-        "- Write entirely in the second person."
+        "- Produce a paragraph in the same tone and clarity as this example:\n" +
+        "  “Your July trip to Vietnam fits perfectly with the country’s summer patterns: bright weather, warm water and vivid green landscapes. Since you want to surf, head south—Mũi Né and nearby spots have the most reliable conditions this time of year. Staying in hostels there matches your style, giving you easy access to board rentals, group lessons and other travelers on the same route. It creates a relaxed, social rhythm for your entire trip.”\n" +
+        "- Follow the same structure: seasonal context + region/activity relevance + how their preferences shape the vibe.\n" +
+        "- Adapt all content to the actual user input."
     }
   ];
+
+  // ---- Call OpenAI --------------------------------------------
+  const res = await fetch(`${OPENAI_API_BASE}/chat/completions`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: OPENAI_MODEL_TEXT,
+      temperature: 0.65,
+      messages,
+    }),
+  });
+
+  if (!res.ok) {
+    const err = await safeErrorText(res);
+    throw new Error(
+      `OpenAI tripSummary error: ${res.status}${err ? ` — ${err}` : ""}`
+    );
+  }
+
+  const j = await res.json();
+  return j?.choices?.[0]?.message?.content?.trim() || null;
+}
 
   const res = await fetch(`${OPENAI_API_BASE}/chat/completions`, {
     method: "POST",
