@@ -2,7 +2,7 @@
   "name": "packlist-bot",
   "version": "1.0.0",
   "private": true,
-  "type": "commonjs",
+  "type": "module",
   "scripts": {
     "dev": "vercel dev",
     "build": "echo \"Vercel builds serverless functions automatically\"",
