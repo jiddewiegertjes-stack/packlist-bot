@@ -857,7 +857,77 @@ async function generateTripSummary(ctx, seasonsCtx, history) {
         "- Do NOT mention packing, gear, lists, or advice.\n" +
         "- No bullets, no headings, no lists."
     },
+async function generateTripSummary(ctx, seasonsCtx, history) {
+  ... veel code ...
+}
 
+/*  ⬇️⬇️⬇️ PUNT 2: HIER TOEVOEGEN ⬇️⬇️⬇️ */
+async function generateSeasonAdvice(ctx, seasonsCtx) {
+  if (!process.env.OPENAI_API_KEY) return null;
+
+  // Bouw een duidelijke inputstructuur voor het LLM
+  const countries = ctx?.destinations?.map(d => d.country).join(", ") ||
+                    ctx?.destination?.country ||
+                    "unknown location";
+
+  const period =
+    ctx?.month
+      ? `in ${ctx.month}`
+      : (ctx?.startDate && ctx?.endDate)
+        ? `from ${ctx.startDate} to ${ctx.endDate}`
+        : "at an unknown time";
+
+  const season = seasonsCtx?.season || null;
+  const risks = seasonsCtx?.seasonalRisks || [];
+
+  const riskText = risks.length
+    ? risks.map(r => `${r.type} (${r.level})`).join(", ")
+    : null;
+
+  const messages = [
+    {
+      role: "system",
+      content:
+        "You write concise, practical, second-person seasonal advice. " +
+        "No lists, no bullets. 3–5 sentences. Always explain climate, temperature feeling, and meaningful things to expect. " +
+        "Do not mention packing items. No poetry."
+    },
+    {
+      role: "user",
+      content:
+        `Write a short climate-season explanation for the user's trip.\n\n` +
+        `Destination(s): ${countries}\n` +
+        `Period: ${period}\n` +
+        `${season ? `Season classification: ${season}\n` : ""}` +
+        `${riskText ? `Main seasonal risks: ${riskText}\n` : ""}` +
+        "If seasonal data is incomplete: make reasonable assumptions and mention them politely."
+    }
+  ];
+
+  const res = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: process.env.OPENAI_MODEL_TEXT || "gpt-4o-mini",
+      temperature: 0.7,
+      messages,
+    }),
+  });
+
+  if (!res.ok) return null;
+  const j = await res.json();
+  return j?.choices?.[0]?.message?.content?.trim() || null;
+}
+/*  ⬆️⬆️⬆️ EINDE PUNT 2 ⬆️⬆️⬆️ */
+
+// gaat verder met:
+function generateRationale(ctx, seasonsCtx) {
+  ...
+}
+    
     {
       role: "user",
       content:
@@ -916,20 +986,31 @@ async function generateAndStream({ controller, send, req, prompt, context, histo
   send("context", { ...derived, ...seasonsCtx });
 
   // ✨ nieuw: trip-verhaal (LLM) zo vroeg mogelijk uitsturen
-  try {
-    const summaryText = await generateTripSummary(context, seasonsCtx, history);
-    if (summaryText) {
-      send("tripSummary", { text: summaryText });
-    }
-  } catch (e) {
-    // stil falen – we willen de rest van de stream niet breken
+try {
+  const summaryText = await generateTripSummary(context, seasonsCtx, history);
+  if (summaryText) {
+    send("tripSummary", { text: summaryText });
   }
+} catch (e) {
+  // stil falen – we willen de rest van de stream niet breken
+}
 
-  // ✨ bestaand: rationale voor intern debug/extra context
-  try {
-    const rationaleText = generateRationale(context, seasonsCtx);
-    if (rationaleText) send("rationale", { text: rationaleText });
-  } catch {}
+/*  ⬇️⬇️⬇️ DIT MOET JIJ TOEVOEGEN (PUNT 1) ⬇️⬇️⬇️ */
+try {
+  const seasonAdviceText = await generateSeasonAdvice(context, seasonsCtx);
+  if (seasonAdviceText) {
+    send("seasonAdvice", { text: seasonAdviceText });
+  }
+} catch (e) {
+  // ook stil falen – moet de rest niet breken
+}
+/*  ⬆️⬆️⬆️ EINDE INVOEGEN ⬆️⬆️⬆️ */
+
+// ✨ bestaand: rationale voor intern debug/extra context
+try {
+  const rationaleText = generateRationale(context, seasonsCtx);
+  if (rationaleText) send("rationale", { text: rationaleText });
+} catch {}
 
   const systemExtras = seasonPromptLines(seasonsCtx);
 
