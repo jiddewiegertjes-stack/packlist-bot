@@ -804,9 +804,10 @@ function generateRationale(ctx, seasonsCtx) {
   return `Tailored for ${countries}${seasonBit}, for ${days}.${because}`;
 }
 
-async function generateTripSummary(ctx, seasonsCtx) {
+async function generateTripSummary(ctx, seasonsCtx, history) {
   if (!process.env.OPENAI_API_KEY) return null;
 
+  // --- Basis uit de “wizard” context ---
   const countries = listCountries(ctx) || "an unknown destination";
   const days = ctx?.durationDays
     ? `${ctx.durationDays} days`
@@ -819,8 +820,52 @@ async function generateTripSummary(ctx, seasonsCtx) {
   const activities = Array.isArray(ctx?.activities) && ctx.activities.length
     ? ctx.activities.join(", ")
     : "no specific activities yet";
+
   const seasonLine = seasonsCtx?.season
     ? `Seasonal context: ${seasonsCtx.season}.`
+    : "";
+
+  // --- Voorkeuren uit de chips (travelStyle/budget/accommodation/workMode) ---
+  const prefs = ctx?.preferences || {};
+  const travelStyleLabel = prefs?.travelStyle
+    ? {
+        ultralight: "ultralight, carrying only the bare essentials",
+        light: "light and flexible, with a compact setup",
+        comfort: "comfort-focused, with extra outfits and gear",
+        luxury: "more luxurious, with extra comfort items",
+      }[prefs.travelStyle] || prefs.travelStyle
+    : "no specific travel style";
+
+  const budgetLabel = prefs?.budgetLevel
+    ? {
+        low: "budget-friendly",
+        mid: "mid-range",
+        high: "higher-end",
+      }[prefs.budgetLevel] || prefs.budgetLevel
+    : "no clear budget preference";
+
+  const accommodationLabel = prefs?.accommodation
+    ? {
+        hostels: "mostly hostels and social stays",
+        hotels: "mainly hotels and guesthouses",
+        mixed: "a mix of hostels and simple hotels",
+      }[prefs.accommodation] || prefs.accommodation
+    : "no specific accommodation type";
+
+  const workModeLabel = prefs?.workMode
+    ? {
+        travel_only: "purely traveling for leisure",
+        travel_plus_work: "combining travel with remote work",
+      }[prefs.workMode] || prefs.workMode
+    : "no work vs. holiday preference";
+
+  // --- Laatste stukjes van de chat zelf (toon & extra details) ---
+  const convoSnippet = Array.isArray(history)
+    ? history
+        .slice(-8) // laatste paar berichten
+        .filter((m) => m.role === "user")
+        .map((m) => `User: ${m.content}`)
+        .join("\n")
     : "";
 
   const messages = [
@@ -829,19 +874,29 @@ async function generateTripSummary(ctx, seasonsCtx) {
       role: "system",
       content:
         "You write short, vivid travel mini-narratives. Describe the trip itself, not a packing list. " +
-        "Return exactly one paragraph, 3–6 sentences, 50–120 words. " +
-        "Do NOT include headings, bullet points or explicit advice. Just describe what the trip will roughly feel like."
+        "Return exactly one paragraph, 3–6 sentences, 70–140 words. " +
+        "Do NOT include headings, bullet points or explicit advice. Just describe what the trip will roughly feel like. " +
+        "Weave in the traveller’s style, budget, accommodation and work situation naturally into the story."
     },
     {
       role: "user",
       content:
-        `Create a 50–120 word narrative description of this backpacking trip.\n` +
-        `Destinations: ${countries}\n` +
-        `Duration: ${days}\n` +
-        `Period: ${period}\n` +
-        `Activities: ${activities}\n` +
-        `${seasonLine}\n` +
-        "Focus on the experience of travelling and what the person will roughly be doing. " +
+        `Create a narrative description of this backpacking trip.\n\n` +
+        `Structured facts:\n` +
+        `- Destinations: ${countries}\n` +
+        `- Duration: ${days}\n` +
+        `- Period: ${period}\n` +
+        `- Activities: ${activities}\n` +
+        `- Travel style: ${travelStyleLabel}\n` +
+        `- Budget: ${budgetLabel}\n` +
+        `- Accommodation: ${accommodationLabel}\n` +
+        `- Work mode: ${workModeLabel}\n` +
+        `${seasonLine ? `- ${seasonLine}\n` : ""}` +
+        (convoSnippet
+          ? `\nConversation snippet (tone & extra hints, do NOT quote literally):\n${convoSnippet}\n`
+          : "") +
+        "\nWrite from the traveller’s perspective. Focus on what their days roughly look like, how the trip feels, " +
+        "and how their style/budget/accommodation/work situation shape the experience. " +
         "Do not mention packing, packing lists, gear lists or checklists. Do not add a title."
     }
   ];
@@ -861,7 +916,9 @@ async function generateTripSummary(ctx, seasonsCtx) {
 
   if (!res.ok) {
     const err = await safeErrorText(res);
-    throw new Error(`OpenAI tripSummary error: ${res.status}${err ? ` — ${err}` : ""}`);
+    throw new Error(
+      `OpenAI tripSummary error: ${res.status}${err ? ` — ${err}` : ""}`
+    );
   }
 
   const j = await res.json();
@@ -878,7 +935,7 @@ async function generateAndStream({ controller, send, req, prompt, context, histo
 
   // ✨ nieuw: trip-verhaal (LLM) zo vroeg mogelijk uitsturen
   try {
-    const summaryText = await generateTripSummary(context, seasonsCtx);
+    const summaryText = await generateTripSummary(context, seasonsCtx, history);
     if (summaryText) {
       send("tripSummary", { text: summaryText });
     }
