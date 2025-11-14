@@ -908,29 +908,6 @@ async function generateTripSummary(ctx, seasonsCtx, history) {
   return j?.choices?.[0]?.message?.content?.trim() || null;
 }
 
-  const res = await fetch(`${OPENAI_API_BASE}/chat/completions`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-    },
-    body: JSON.stringify({
-      model: OPENAI_MODEL_TEXT,
-      temperature: 0.7,
-      messages,
-    }),
-  });
-
-  if (!res.ok) {
-    const err = await safeErrorText(res);
-    throw new Error(`OpenAI tripSummary error: ${res.status}${err ? ` — ${err}` : ""}`);
-  }
-
-  const j = await res.json();
-  const txt = j?.choices?.[0]?.message?.content || "";
-  return txt.trim();
-}
-
 async function generateAndStream({ controller, send, req, prompt, context, history, lastUserMessage, nluHints }) {
   const derived = await derivedContext(context);
   const seasonsCtx = await seasonsContextFor(context);
