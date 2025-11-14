@@ -807,11 +807,11 @@ function generateRationale(ctx, seasonsCtx) {
 async function generateTripSummary(ctx, seasonsCtx, history) {
   if (!process.env.OPENAI_API_KEY) return null;
 
-  // --- Basis uit de “wizard” context ---
+  // --- Extract structured context ---
   const countries = listCountries(ctx) || "an unknown destination";
   const days = ctx?.durationDays
     ? `${ctx.durationDays} days`
-    : "an open-ended amount of time";
+    : "an open-ended duration";
   const period = ctx?.month
     ? `in ${ctx.month}`
     : (ctx?.startDate && ctx?.endDate)
@@ -819,75 +819,82 @@ async function generateTripSummary(ctx, seasonsCtx, history) {
       : "at an unspecified time of year";
   const activities = Array.isArray(ctx?.activities) && ctx.activities.length
     ? ctx.activities.join(", ")
-    : "no specific activities yet";
+    : "no specific activities listed";
 
-  const seasonLine = seasonsCtx?.season
-    ? `Seasonal context: ${seasonsCtx.season}.`
-    : "";
-
-  // --- Voorkeuren uit de chips (travelStyle/budget/accommodation/workMode) ---
   const prefs = ctx?.preferences || {};
+
   const travelStyleLabel = prefs?.travelStyle
     ? {
-        ultralight: "ultralight, carrying only the bare essentials",
-        light: "light and flexible, with a compact setup",
-        comfort: "comfort-focused, with extra outfits and gear",
-        luxury: "more luxurious, with extra comfort items",
+        ultralight: "an ultralight style",
+        light: "a light and flexible style",
+        comfort: "a comfort-focused style",
+        luxury: "a more luxurious approach",
       }[prefs.travelStyle] || prefs.travelStyle
     : "no specific travel style";
 
   const budgetLabel = prefs?.budgetLevel
     ? {
-        low: "budget-friendly",
-        mid: "mid-range",
-        high: "higher-end",
+        low: "a budget-friendly mindset",
+        mid: "a mid-range spending style",
+        high: "a higher-end budget",
       }[prefs.budgetLevel] || prefs.budgetLevel
     : "no clear budget preference";
 
   const accommodationLabel = prefs?.accommodation
     ? {
-        hostels: "mostly hostels and social stays",
-        hotels: "mainly hotels and guesthouses",
+        hostels: "a preference for social hostels",
+        hotels: "a preference for hotels or guesthouses",
         mixed: "a mix of hostels and simple hotels",
       }[prefs.accommodation] || prefs.accommodation
-    : "no specific accommodation type";
+    : "no accommodation preference";
 
   const workModeLabel = prefs?.workMode
     ? {
         travel_only: "purely traveling for leisure",
-        travel_plus_work: "combining travel with remote work",
+        travel_plus_work: "travel combined with remote work",
       }[prefs.workMode] || prefs.workMode
-    : "no work vs. holiday preference";
+    : "no work/holiday preference";
 
-  // --- Laatste stukjes van de chat zelf (toon & extra details) ---
+  const seasonLine = seasonsCtx?.season
+    ? `Seasonal context: ${seasonsCtx.season}.`
+    : "";
+
+  // Snippet from previous chat (helps personalization)
   const convoSnippet = Array.isArray(history)
     ? history
-        .slice(-8) // laatste paar berichten
+        .slice(-8)
         .filter((m) => m.role === "user")
-        .map((m) => `User: ${m.content}`)
+        .map((m) => m.content)
         .join("\n")
     : "";
 
-    const messages = [
-    forceEnglishSystem(),
+  // --- PROMPT MESSAGE SET (new, improved, “social proof” style) ---
+  const messages = [
     {
       role: "system",
       content:
-        "You write short, vivid trip summaries in clear, natural English.\n" +
-        "- Always write in the SECOND person (‘you’, ‘your trip’). Never use ‘I’ or ‘we’.\n" +
-        "- Tone: warm, enthusiastic and motivating – it should make the reader excited about their own trip.\n" +
-        "- Output: exactly ONE paragraph, 4–6 sentences, roughly 70–140 words.\n" +
-        "- Describe the experience of the trip: what the days feel like, typical moments, atmosphere, and vibe.\n" +
-        "- Briefly weave in travel style, budget, accommodation and work situation as context, not as a dry list.\n" +
-        "- If there is seasonal or climate information, explicitly mention why that period is special (e.g. less rain, green rice fields, cooler evenings).\n" +
-        "- Never mention packing, packing lists, gear, checklists, or advice.\n" +
-        "- Do not add a title or headings."
+        "You create short, vivid, second-person travel summaries that feel highly personalized.\n" +
+        "Tone:\n" +
+        "- Warm, enthusiastic, motivating, emotionally engaging.\n" +
+        "- Make the reader feel truly understood and excited about their own trip.\n\n" +
+        "Writing rules:\n" +
+        "- ALWAYS write in the SECOND person ('you', 'your trip'). Never use 'I', 'me', or 'we'.\n" +
+        "- Output exactly ONE paragraph of 4–6 sentences (70–140 words).\n" +
+        "- Describe what the reader’s days will FEEL like: atmosphere, rhythm, landscapes, people, energy.\n" +
+        "- Subtly weave in the user’s actual input: destinations, timing, activities, travel style, budget, accommodation, work mode.\n" +
+        "- Use PERSONALIZATION explicitly but naturally:\n" +
+        "  e.g., 'Since you're traveling in July...', 'Because you prefer hostels...', 'Given your plan to surf...'\n" +
+        "- Highlight what is special about that timing/season if possible.\n" +
+        "- Never list inputs mechanically or in bullet points.\n" +
+        "- Never mention packing, gear, lists, or advice.\n" +
+        "- No titles, no headings."
     },
+
     {
       role: "user",
       content:
-        `Write an exciting, second-person summary of this backpacking trip.\n\n` +
-        `Facts about the trip:\n` +
+        `Write a highly personalized, exciting second-person summary of this trip.\n\n` +
+        `Trip facts for inspiration:\n` +
         `- Destinations: ${countries}\n` +
         `- Duration: ${days}\n` +
         `- Period: ${period}\n` +
@@ -896,13 +903,15 @@ async function generateTripSummary(ctx, seasonsCtx, history) {
         `- Budget: ${budgetLabel}\n` +
         `- Accommodation: ${accommodationLabel}\n` +
         `- Work mode: ${workModeLabel}\n` +
-        `${seasonLine ? `- ${seasonLine}\n` : ""}` +
+        `${seasonLine ? "- " + seasonLine + "\n" : ""}` +
         (convoSnippet
-          ? `\nExtra hints from the conversation (do NOT quote literally, only use as inspiration):\n${convoSnippet}\n`
+          ? `\nAdditional hints from the conversation (do NOT quote literally, just use the vibe):\n${convoSnippet}\n`
           : "") +
-        "\nStart with something like “Your trip to … in …” or “On your trip you…” and then describe what their days roughly look like, " +
-        "why this period in these destinations is special (e.g. weather, landscape, atmosphere), and how their style/budget/accommodation/work situation shape the experience. " +
-        "Write as if you are talking directly to them about their own upcoming adventure."
+        "\nYour goal:\n" +
+        "- Make the paragraph clearly feel tailored to THIS user's situation.\n" +
+        "- Show (subtly) that the trip's atmosphere, timing, and style are shaped by their preferences.\n" +
+        "- Describe what their experience will FEEL like — emotionally, visually, energetically.\n" +
+        "- Write entirely in the second person."
     }
   ];
 
@@ -921,9 +930,7 @@ async function generateTripSummary(ctx, seasonsCtx, history) {
 
   if (!res.ok) {
     const err = await safeErrorText(res);
-    throw new Error(
-      `OpenAI tripSummary error: ${res.status}${err ? ` — ${err}` : ""}`
-    );
+    throw new Error(`OpenAI tripSummary error: ${res.status}${err ? ` — ${err}` : ""}`);
   }
 
   const j = await res.json();
