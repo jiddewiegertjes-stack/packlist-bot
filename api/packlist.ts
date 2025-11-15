@@ -1631,6 +1631,10 @@ function mapCsvRow(r: any) {
     seasons: r.seasons || "",
     url: r.url || "",
     image: r.image || "",
+
+    // 🔹 HIER: notes uit je CSV meesturen
+    notes: r.notes ?? r.note ?? r.Notes ?? "",
+
     priority: r.priority ?? r.prio ?? r.importance ?? r.tier ?? r.priority_level ?? "",
     must_have: r.must_have ?? r.musthave ?? "",
     should_have: r.should_have ?? r.shouldhave ?? "",
