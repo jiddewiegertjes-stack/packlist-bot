@@ -1629,13 +1629,26 @@ function mapCsvRow(r: any) {
       : null,
     activities: r.activities || "",
     seasons: r.seasons || "",
+
+    // 🔹 fallback / generieke url
     url: r.url || "",
+
+    // 🔹 per-land urls (komen uit je CSV columns url_us / url_nl)
+    url_us: r.url_us || r.url || "",
+    url_nl: r.url_nl || "",
+
     image: r.image || "",
 
-    // 🔹 HIER: notes uit je CSV meesturen
+    // notes
     notes: r.notes ?? r.note ?? r.Notes ?? "",
 
-    priority: r.priority ?? r.prio ?? r.importance ?? r.tier ?? r.priority_level ?? "",
+    priority:
+      r.priority ??
+      r.prio ??
+      r.importance ??
+      r.tier ??
+      r.priority_level ??
+      "",
     must_have: r.must_have ?? r.musthave ?? "",
     should_have: r.should_have ?? r.shouldhave ?? "",
     nice_to_have: r.nice_to_have ?? r.nicetohave ?? "",
