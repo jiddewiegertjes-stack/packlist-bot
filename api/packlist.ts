@@ -1542,6 +1542,32 @@ function anyIntersect(aSet: Set<string>, bSet: Set<string>) {
   return false;
 }
 
+// 🔹 Helper: bereken aanbevolen quantity voor kleding o.b.v. tripduur
+function computeQuantityForTrip(days: number | null, p: any): number | null {
+  // geen duur bekend óf geen clothing → geen quantity
+  if (!days || norm(p.category) !== "clothing") return null;
+
+  const short = p.qty_short ?? null;
+  const medium = p.qty_medium ?? null;
+  const long = p.qty_long ?? null;
+
+  // als er helemaal geen qty-info in de CSV staat → niks doen
+  if (short == null && medium == null && long == null) return null;
+
+  // 0–15 dagen
+  if (days <= 15) {
+    return short ?? medium ?? long ?? null;
+  }
+
+  // 16–30 dagen
+  if (days <= 30) {
+    return medium ?? long ?? short ?? null;
+  }
+
+  // 30+ dagen
+  return long ?? medium ?? short ?? null;
+}
+
 async function productsFromCSV(ctx: any, req: Request) {
   const origin = new URL(req.url).origin;
   const resolvedUrl = resolveCsvUrl(origin);
@@ -1600,8 +1626,15 @@ async function productsFromCSV(ctx: any, req: Request) {
   });
 
   const mapped = selected.map(({ row }) => mapCsvRow(row));
+ const days = ctx?.durationDays ?? null;
+
+  const mappedWithQuantity = mapped.map((p) => {
+    const quantity = computeQuantityForTrip(days, p);
+    return quantity != null ? { ...p, quantity } : p;
+  });
+
   const dedup = dedupeBy(
-    mapped,
+    mappedWithQuantity,
     (p) => `${p.category}|${p.name}`,
   ).slice(0, 72);
 
@@ -1630,18 +1663,12 @@ function mapCsvRow(r: any) {
     activities: r.activities || "",
     seasons: r.seasons || "",
 
-    // 🔹 fallback / generieke url
     url: r.url || "",
-
-    // 🔹 per-land urls (komen uit je CSV columns url_us / url_nl)
     url_us: r.url_us || r.url || "",
     url_nl: r.url_nl || "",
-
     image: r.image || "",
 
-    // notes
     notes: r.notes ?? r.note ?? r.Notes ?? "",
-
     priority:
       r.priority ??
       r.prio ??
@@ -1652,6 +1679,11 @@ function mapCsvRow(r: any) {
     must_have: r.must_have ?? r.musthave ?? "",
     should_have: r.should_have ?? r.shouldhave ?? "",
     nice_to_have: r.nice_to_have ?? r.nicetohave ?? "",
+
+    // 🔹 NIEUW: quantity velden rechtstreeks uit CSV
+    qty_short: r.qty_short ? Number(r.qty_short) : null,
+    qty_medium: r.qty_medium ? Number(r.qty_medium) : null,
+    qty_long: r.qty_long ? Number(r.qty_long) : null,
   };
 }
 
