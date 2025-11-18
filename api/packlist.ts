@@ -106,21 +106,45 @@ export async function POST(req: Request) {
         return closeWithError("Invalid JSON body");
       }
 
-      const safeContext = normalizeContext(body?.context);
+const safeContext = normalizeContext(body?.context);
 
-      // 🔹 Heel simpele LLM-check: is homeCountry Nederland?
-      // Verwacht context.profile.homeCountry uit de frontend.
-      if (safeContext?.profile?.homeCountry) {
-        try {
-          const isNL = await detectIsDutchHomeCountry(
-            String(safeContext.profile.homeCountry),
-          );
-          safeContext.profile.market = isNL ? "nl" : "us";
-        } catch {
-          // Als de LLM-call faalt, gewoon geen market zetten: geen crash.
-        }
-      }
-      const message = (body?.message || "").trim();
+// 🔹 Bepaal ruwe homeCountry-tekst: eerst uit context/profile, anders uit losse velden, anders uit message
+const rawHomeCountry =
+  (safeContext as any)?.profile?.homeCountry ||
+  (body as any)?.homeCountry ||
+  (body as any)?.profile?.homeCountry ||
+  (body as any)?.country ||
+  (body as any)?.origin ||
+  (body?.qaInput && (body.qaInput.homeCountry || body.qaInput.country)) ||
+  (body?.message as string) ||
+  "";
+
+// Zorg dat profile bestaat
+if (!safeContext.profile) safeContext.profile = {};
+
+if (rawHomeCountry && typeof rawHomeCountry === "string") {
+  try {
+    const detected = await detectHomeCountry(rawHomeCountry);
+
+    // Wat we naar de frontend willen sturen:
+    safeContext.profile.homeCountryDetected = detected.country || null;  // bv. "Netherlands"
+    safeContext.profile.homeCountryCode = detected.iso2 || null;        // bv. "NL"
+
+    // Optioneel: simpele market-afleiding
+    if (detected.iso2 === "NL") {
+      safeContext.profile.market = "nl";
+    } else if (detected.iso2 === "US") {
+      safeContext.profile.market = "us";
+    } else {
+      safeContext.profile.market = "intl";
+    }
+  } catch {
+    // Bij fout: niets doen, geen crash
+  }
+}
+
+const message = (body?.message || "").trim();
+
       const hasDirectPrompt =
         typeof body?.prompt === "string" && body.prompt.trim().length > 0;
 
@@ -196,19 +220,24 @@ export async function POST(req: Request) {
           hasPeriodSignal ||
           hasDurationSignal;
 
-        if (!ALWAYS_GENERATE && allHardMissing && !hasAnySignal) {
-          const followupQ = followupQuestion({
-            missing,
-            context: safeContext,
-          });
-          send("needs", { missing, contextOut: {} });
-          const derived = await derivedContext(safeContext);
-          const seasonsCtx = await seasonsContextFor(safeContext);
-          send("ask", { question: followupQ, missing });
-          send("context", { ...derived, ...seasonsCtx });
-          controller.close();
-          return;
-        }
+if (!ALWAYS_GENERATE && allHardMissing && !hasAnySignal) {
+  const followupQ = followupQuestion({
+    missing,
+    context: safeContext,
+  });
+  send("needs", { missing, contextOut: {} });
+  const derived = await derivedContext(safeContext);
+  const seasonsCtx = await seasonsContextFor(safeContext);
+  send("ask", { question: followupQ, missing });
+  send("context", {
+    ...derived,
+    ...seasonsCtx,
+    profile: safeContext.profile || null,   // 👈 hier ook
+  });
+  controller.close();
+  return;
+}
+
 
         const prompt = hasDirectPrompt
           ? body.prompt.trim()
@@ -247,6 +276,8 @@ export async function POST(req: Request) {
 function normalizeContext(ctx: any = {}) {
   const c =
     typeof ctx === "object" && ctx ? structuredClone(ctx) : ({} as any);
+
+    c.profile = c.profile || {};        // 👈 NIEUW
 
   // bestaande velden
   c.destination = c.destination || {};
@@ -332,36 +363,46 @@ function hasAnyNonEmptyString(obj: Record<string, any>) {
  * Geeft true terug als het met heel grote waarschijnlijkheid NL is
  * (Netherlands, Holland, NL, Dutch, Amsterdam, etc.), anders false.
  */
-async function detectIsDutchHomeCountry(input: string): Promise<boolean> {
+/**
+ * LLM-helper: haal het meest waarschijnlijke land uit vrije tekst.
+ * Geeft een genormaliseerde Engelse landnaam + ISO2-code terug.
+ */
+async function detectHomeCountry(
+  input: string,
+): Promise<{ country: string | null; iso2: string | null }> {
   if (!process.env.OPENAI_API_KEY || !input || typeof input !== "string") {
-    return false;
+    return { country: null, iso2: null };
   }
 
   const schema = {
     type: "object",
     additionalProperties: false,
     properties: {
-      isNL: { type: "boolean" },
+      country: { type: ["string", "null"] }, // bv. "Netherlands"
+      iso2: { type: ["string", "null"] },    // bv. "NL"
     },
-    required: ["isNL"],
+    required: ["country", "iso2"],
   };
 
   const sys =
-    "Je taak: bepaal op basis van het antwoord van een gebruiker of deze in Nederland woont of uit Nederland komt.\n" +
-    "- Zet isNL=true als het antwoord duidelijk wijst op Nederland: 'Netherlands', 'the Netherlands', 'Holland', 'NL', 'Dutch', of Nederlandse steden/regio's (Amsterdam, Rotterdam, Utrecht, etc.).\n" +
-    "- In álle andere gevallen isNL=false.\n" +
-    "Antwoord ALLEEN als JSON met veld isNL (boolean).";
+    "Je taak: lees een vrij antwoord van een gebruiker (in elke taal) en bepaal uit welk land deze persoon komt of in welk land hij/zij woont.\n" +
+    "- Normaliseer de landnaam naar Engels, bijv. 'Nederland' -> 'Netherlands', 'Verenigde Staten' -> 'United States'.\n" +
+    "- Geef óók de officiële ISO 3166-1 alpha-2 country code terug (twee letters), bijv. 'Netherlands' -> 'NL', 'United States' -> 'US'.\n" +
+    "- Als je het land niet redelijk zeker weet, zet beide velden op null.\n" +
+    "Antwoord ALLEEN als JSON met velden country en iso2.";
 
   const user =
     `Antwoord van gebruiker op 'Where do you live / what's your home country?': "${input}".\n` +
-    "Geef isNL=true of isNL=false.";
+    "Bepaal country (Engelse naam) en iso2.";
 
   try {
     const json = await chatJSON(sys, user, schema);
-    return !!json?.isNL;
+    return {
+      country: (json && json.country) || null,
+      iso2: (json && json.iso2 ? String(json.iso2).toUpperCase() : null),
+    };
   } catch {
-    // Bij fout gewoon veilig terugvallen op 'niet NL'
-    return false;
+    return { country: null, iso2: null };
   }
 }
 
@@ -1261,8 +1302,13 @@ async function generateAndStream({
     season: effectiveSeason,
   };
 
-  // seizoenscontext naar frontend
-  send("context", { ...derived, ...combinedSeasonsCtx });
+// seizoenscontext + profile (incl. detected country) naar frontend
+send("context", {
+  ...derived,
+  ...combinedSeasonsCtx,
+  profile: context.profile || null,  // 👈 NIEUW
+});
+
 
   // trip-verhaal (LLM) vroeg uitsturen
   try {
@@ -1346,11 +1392,16 @@ async function generateAndStream({
     ]);
   }
 
-  // nogmaals context (zodat frontend laatste seizoensinfo heeft)
-  send("context", { ...derived, ...combinedSeasonsCtx });
+  // nogmaals context (zodat frontend laatste data heeft)
+  send("context", {
+    ...derived,
+    ...combinedSeasonsCtx,
+    profile: context.profile || null,
+  });
   send("done", {});
-  controller.close();
-}
+  controller.close();          // 👈 stream netjes sluiten
+}                              // 👈 einde generateAndStream
+
 
 /* -------------------- Context samenvatting -------------------- */
 
