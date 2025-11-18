@@ -107,21 +107,6 @@ export async function POST(req: Request) {
       }
 
       const safeContext = normalizeContext(body?.context);
-
-      // 🔹 LLM: afleiden van market/lang op basis van homeCountry (Nederland-detectie)
-      if (safeContext?.profile?.homeCountry) {
-        try {
-          const { market, lang } = await detectMarketFromHome(
-            safeContext.profile.homeCountry,
-          );
-          safeContext.profile = safeContext.profile || {};
-          safeContext.profile.market = market;
-          safeContext.profile.lang = lang;
-        } catch (e) {
-          console.error("detectMarketFromHome failed", e);
-        }
-      }
-
       const message = (body?.message || "").trim();
       const hasDirectPrompt =
         typeof body?.prompt === "string" && body.prompt.trim().length > 0;
@@ -256,7 +241,7 @@ function normalizeContext(ctx: any = {}) {
     c.activities = String(c.activities)
       .split(",")
       .map((s: string) => s.trim())
-      .filter((s: string) => s.length > 0);
+      .filter(Boolean);
   }
   ensureKeys(c, ["durationDays", "startDate", "endDate", "month", "preferences"]);
 
@@ -327,49 +312,6 @@ function hasAnyNonEmptyString(obj: Record<string, any>) {
   return Object.values(obj).some(
     (v) => typeof v === "string" && v.trim().length > 0,
   );
-}
-
-/**
- * 🔹 LLM-helper: bepaal of homeCountry-input Nederland is → market/lang
- */
-async function detectMarketFromHome(home: string) {
-  if (
-    !process.env.OPENAI_API_KEY ||
-    !home ||
-    typeof home !== "string"
-  ) {
-    return { market: "us", lang: "en" };
-  }
-
-  const schema = {
-    type: "object",
-    additionalProperties: false,
-    properties: {
-      market: { type: "string", enum: ["nl", "us"] },
-      lang: { type: "string", enum: ["nl", "en"] },
-    },
-    required: ["market", "lang"],
-  };
-
-  const sys =
-    "Je taak: bepaal op basis van user-input in welke MARKT de gebruiker valt.\n" +
-    "- Als de gebruiker duidelijk uit Nederland komt (Nederland, Holland, NL, The Netherlands, Dutch, Amsterdam, Rotterdam etc.): market = 'nl'.\n" +
-    "- In álle andere gevallen: market = 'us'.\n" +
-    "- Kies lang = 'nl' bij market 'nl', anders 'en'.\n" +
-    "Antwoord ALLEEN als JSON volgens het schema.";
-
-  const user =
-    `User home country answer: "${home}".\n` +
-    "Kies de meest logische market/lang combinatie.";
-
-  try {
-    const json = await chatJSON(sys, user, schema);
-    const market = json?.market === "nl" ? "nl" : "us";
-    const lang = market === "nl" ? "nl" : "en";
-    return { market, lang };
-  } catch {
-    return { market: "us", lang: "en" };
-  }
 }
 
 async function evaluateAnswersLLM(utterance: string) {
@@ -1129,7 +1071,7 @@ async function generateTripSummary(
           : "") +
         "\nYour goal:\n" +
         "- Produce a paragraph in the same tone and clarity as this example:\n" +
-        '  “Your July trip to Vietnam fits perfectly with the country’s summer patterns: bright weather, warm water and vivid green landscapes. Since you want to surf, head south—Mũi Né and nearby spots have the most reliable conditions this time of year. Staying in hostels there matches your style, giving you easy access to board rentals, group lessons and other travelers on the same route. It creates a relaxed, social rhythm for your entire trip.”\n" +
+        '  “Your July trip to Vietnam fits perfectly with the country’s summer patterns: bright weather, warm water and vivid green landscapes. Since you want to surf, head south—Mũi Né and nearby spots have the most reliable conditions this time of year. Staying in hostels there matches your style, giving you easy access to board rentals, group lessons and other travelers on the same route. It creates a relaxed, social rhythm for your entire trip.”\n' +
         "- Follow the same structure: seasonal context + region/activity relevance + how their preferences shape the vibe.\n" +
         "- Adapt all content to the actual user input.",
     },
@@ -1268,12 +1210,8 @@ async function generateAndStream({
     season: effectiveSeason,
   };
 
-  // seizoenscontext + profiel naar frontend
-  send("context", {
-    ...derived,
-    ...combinedSeasonsCtx,
-    profile: context?.profile || undefined,
-  });
+  // seizoenscontext naar frontend
+  send("context", { ...derived, ...combinedSeasonsCtx });
 
   // trip-verhaal (LLM) vroeg uitsturen
   try {
@@ -1358,11 +1296,7 @@ async function generateAndStream({
   }
 
   // nogmaals context (zodat frontend laatste seizoensinfo heeft)
-  send("context", {
-    ...derived,
-    ...combinedSeasonsCtx,
-    profile: context?.profile || undefined,
-  });
+  send("context", { ...derived, ...combinedSeasonsCtx });
   send("done", {});
   controller.close();
 }
@@ -1692,7 +1626,7 @@ async function productsFromCSV(ctx: any, req: Request) {
   });
 
   const mapped = selected.map(({ row }) => mapCsvRow(row));
-  const days = ctx?.durationDays ?? null;
+ const days = ctx?.durationDays ?? null;
 
   const mappedWithQuantity = mapped.map((p) => {
     const quantity = computeQuantityForTrip(days, p);
