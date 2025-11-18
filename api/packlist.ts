@@ -107,6 +107,19 @@ export async function POST(req: Request) {
       }
 
       const safeContext = normalizeContext(body?.context);
+
+      // 🔹 Heel simpele LLM-check: is homeCountry Nederland?
+      // Verwacht context.profile.homeCountry uit de frontend.
+      if (safeContext?.profile?.homeCountry) {
+        try {
+          const isNL = await detectIsDutchHomeCountry(
+            String(safeContext.profile.homeCountry),
+          );
+          safeContext.profile.market = isNL ? "nl" : "us";
+        } catch {
+          // Als de LLM-call faalt, gewoon geen market zetten: geen crash.
+        }
+      }
       const message = (body?.message || "").trim();
       const hasDirectPrompt =
         typeof body?.prompt === "string" && body.prompt.trim().length > 0;
@@ -312,6 +325,44 @@ function hasAnyNonEmptyString(obj: Record<string, any>) {
   return Object.values(obj).some(
     (v) => typeof v === "string" && v.trim().length > 0,
   );
+}
+
+/**
+ * LLM-helper: bepaal of de ingevulde homeCountry tot Nederland hoort.
+ * Geeft true terug als het met heel grote waarschijnlijkheid NL is
+ * (Netherlands, Holland, NL, Dutch, Amsterdam, etc.), anders false.
+ */
+async function detectIsDutchHomeCountry(input: string): Promise<boolean> {
+  if (!process.env.OPENAI_API_KEY || !input || typeof input !== "string") {
+    return false;
+  }
+
+  const schema = {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      isNL: { type: "boolean" },
+    },
+    required: ["isNL"],
+  };
+
+  const sys =
+    "Je taak: bepaal op basis van het antwoord van een gebruiker of deze in Nederland woont of uit Nederland komt.\n" +
+    "- Zet isNL=true als het antwoord duidelijk wijst op Nederland: 'Netherlands', 'the Netherlands', 'Holland', 'NL', 'Dutch', of Nederlandse steden/regio's (Amsterdam, Rotterdam, Utrecht, etc.).\n" +
+    "- In álle andere gevallen isNL=false.\n" +
+    "Antwoord ALLEEN als JSON met veld isNL (boolean).";
+
+  const user =
+    `Antwoord van gebruiker op 'Where do you live / what's your home country?': "${input}".\n` +
+    "Geef isNL=true of isNL=false.";
+
+  try {
+    const json = await chatJSON(sys, user, schema);
+    return !!json?.isNL;
+  } catch {
+    // Bij fout gewoon veilig terugvallen op 'niet NL'
+    return false;
+  }
 }
 
 async function evaluateAnswersLLM(utterance: string) {
