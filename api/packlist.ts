@@ -1646,8 +1646,8 @@ function anyIntersect(aSet: Set<string>, bSet: Set<string>) {
 
 // 🔹 Helper: bereken aanbevolen quantity voor kleding o.b.v. tripduur
 function computeQuantityForTrip(days: number | null, p: any): number | null {
-  // geen duur bekend óf geen clothing → geen quantity
-  if (!days || norm(p.category) !== "clothing") return null;
+  // alleen kleding krijgt automatisch een quantity
+  if (norm(p.category) !== "clothing") return null;
 
   const short = p.qty_short ?? null;
   const medium = p.qty_medium ?? null;
@@ -1656,18 +1656,34 @@ function computeQuantityForTrip(days: number | null, p: any): number | null {
   // als er helemaal geen qty-info in de CSV staat → niks doen
   if (short == null && medium == null && long == null) return null;
 
-  // 0–15 dagen
-  if (days <= 15) {
-    return short ?? medium ?? long ?? null;
+  // 👉 Kies een “bucket” o.b.v. tripduur.
+  //    - Geen duur bekend  → medium als veilige default
+  //    - ≤ 10 dagen        → short
+  //    - 11–21 dagen       → medium
+  //    - > 21 dagen        → long
+  let bucket: "short" | "medium" | "long";
+  if (!days) {
+    bucket = "medium";
+  } else if (days <= 10) {
+    bucket = "short";
+  } else if (days <= 21) {
+    bucket = "medium";
+  } else {
+    bucket = "long";
   }
 
-  // 16–30 dagen
-  if (days <= 30) {
-    return medium ?? long ?? short ?? null;
+  let v: number | null;
+  if (bucket === "short") {
+    v = (short ?? medium ?? long) as number | null;
+  } else if (bucket === "medium") {
+    v = (medium ?? long ?? short) as number | null;
+  } else {
+    v = (long ?? medium ?? short) as number | null;
   }
 
-  // 30+ dagen
-  return long ?? medium ?? short ?? null;
+  if (v == null) return null;
+  if (!Number.isFinite(v) || v <= 0) return null;
+  return v;
 }
 
 async function productsFromCSV(ctx: any, req: Request) {
